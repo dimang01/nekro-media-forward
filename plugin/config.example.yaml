@@ -1,0 +1,37 @@
+# video_forward 插件配置示例
+# 复制到 NekroAgent 的插件配置里，或作为 plugin_data/local_video.video_forward/config.yaml 的模板
+
+# NapCat 访问 NekroAgent 的地址（不带 /webui 后缀）
+public_base_url: "http://1.2.3.4:8022"
+
+# 单个视频/图片体积上限（MB）
+max_file_size_mb: 60
+
+# /media/{token} 临时链接有效期（分钟）
+expiry_minutes: 30
+
+# 同一聊天两次处理的最小间隔（秒）
+cooldown_seconds: 3
+
+# 小红书兜底用的 yt-dlp（yt-dlp 会被重定向到登录页时用）
+yt_dlp_path: "/usr/local/bin/yt-dlp"
+
+# 本地解析器
+resolver_enabled: true
+# 自己生成一串足够长的随机字符，解析器 config.json 用同一个
+resolver_token: "CHANGE_ME_to_a_long_random_string"
+resolver_timeout: 120
+resolver_stale_seconds: 60
+
+# 合并转发超时（大视频上传慢）
+send_timeout: 300
+
+# 图文笔记最多发送张数（1~20）
+max_images: 9
+
+# NapCat 与解析器同一台机器时设为 true（TikTok 走本机路径直传，零中转）
+# NapCat 在云端时保持 false（改由解析器上传文件）
+allow_resolver_local_path: false
+
+# 合并转发卡片里显示的昵称（发送者账号自动取 bot.self_id）
+forward_nickname: "机器人"

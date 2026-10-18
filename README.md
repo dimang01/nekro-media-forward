@@ -1,0 +1,194 @@
+# nekro-media-forward
+
+> bot媒体转发 · QQ 短视频 / 图文自动合并转发（NekroAgent + OneBot v11 / NapCat）
+
+[![ci](https://github.com/maoxian1527-ops/nekro-media-forward/actions/workflows/ci.yml/badge.svg)](https://github.com/maoxian1527-ops/nekro-media-forward/actions/workflows/ci.yml)
+[English](README.en.md) · 中文
+
+
+把 抖音 / 小红书 / TikTok  的公开视频链接，自动解析并以 QQ **合并转发**发回原聊天。
+为 [NekroAgent](https://github.com/KroMiose/nekro-agent) + OneBot v11 / NapCat 设计，附带一个可选的
+**本地解析器（media-resolver）**，用来处理机房 IP 拿不到的抖音/小红书直链，以及必须走代理的 TikTok。
+
+- **零第三方依赖**：插件是单文件 Python（只用 NekroAgent 自带能力），解析器是单文件 Node.js（只用标准库 + 系统里的 Edge）
+- **不打断聊天**：链接消息由插件直接处理并阻断 AI 触发，不会让机器人"再回一句"
+- **住宅 IP 解析**：机房 IP 解析抖音容易被风控，解析器跑在你家里的电脑上，用真实无头浏览器取直链
+- **主动轮询**：解析器在家宽 NAT 后面也能用，服务器不需要能连回本地
+
+---
+
+## 功能一览
+
+| 平台 | 视频 | 图文（图集） | 说明 |
+|---|---|---|---|
+| 抖音 | ✅ | ✅ | 直链由本地解析器取；图文作品按图片组发出 |
+| 小红书 | ✅ | ✅ | 需登录/风控的笔记会失败，属于平台限制 |
+| TikTok | ✅ | — | 解析器**经代理**下载到本机，再把文件交给 NapCat |
+
+
+- 视频以**合并转发**发出（一条卡片，附原链接）
+- 图文笔记以**一条合并转发**装多张图（`max_images` 控制上限，默认 9 张）
+- 提供 `/resolver/self-test` 自检接口，一条命令验证「解析 → 下载 → 图片 → 上传」全链路
+- 内置去重与冷却（同一条链接 30 分钟内不重复发送）
+
+---
+
+## 架构
+
+```
+QQ 群/私聊消息（含链接）
+        │
+        ▼
+┌─────────────────────────────┐
+│ NekroAgent + 本插件          │  ① 识别链接 → ② 解析 → ③ 下载/取文件 → ④ 合并转发
+│  /resolver/* 任务队列接口     │
+└──────────────┬──────────────┘
+               │ 解析器主动轮询（长轮询，含密钥）
+               ▼
+┌─────────────────────────────┐
+│ media-resolver（家里电脑）    │  无头 Edge + CDP：打开真实页面，抓 __INITIAL_STATE__
+│  抖音/小红书直链、TikTok 下载  │  住宅 IP + 真实浏览器，避开机房 IP 风控
+└─────────────────────────────┘
+```
+
+任务流转：
+
+1. 插件发现链接 → 若是抖音/小红书/TikTok，把任务放进队列并**长轮询等待**结果
+2. 解析器轮询取任务 → 用浏览器解析（TikTok 则直接代理下载文件）→ 回报直链/文件
+3. 插件下载直链（TikTok 用解析器给的文件）→ 生成临时链接 `/media/{token}` → `send_group_forward_msg`
+4. `NapCat` 从临时链接取文件并上传到 QQ（NapCat 与解析器同机时可直接读本机文件，见下）
+
+---
+
+## 安装
+
+### 1) 安装插件（NekroAgent）
+
+把 `plugin/plugin.py` 放到 NekroAgent 的插件目录，重启容器：
+
+```bash
+# 形如：
+docker cp plugin/plugin.py nekro_agent:/app/plugins/workdir/video_forward/plugin.py
+docker restart nekro_agent
+```
+
+然后在 NekroAgent 的插件配置里填写（见下面的配置表），至少需要：
+
+- `public_base_url`：NapCat 能访问到的 NekroAgent 地址（如 `http://1.2.3.4:8022`）
+- `resolver_token`：自己随便生成一串足够长的随机字符，解析器要用同一个值
+
+### 2) 安装本地解析器（可选，但抖音/小红书/TikTok 需要）
+
+需要 Windows + Node.js ≥ 18 + Edge（系统自带即可）。
+
+```powershell
+mkdir C:\media-resolver
+# 复制 resolver/ 下的三个文件进去：resolver.js、agent.js、start.bat
+copy resolver\config.example.json C:\media-resolver\config.json
+# 编辑 config.json：server 填你的 NekroAgent 地址，token 与插件里的 resolver_token 一致
+```
+
+双击 `start.bat` 启动（或用 `resolver/install-autostart.ps1` 配开机自启）。
+启动日志里出现 `解析器已启动，服务器： ...` 即成功；插件状态接口会显示 `"online": true`。
+
+> 解析器首次启动会预热一次无头 Edge，若报 `浏览器预热失败`，见
+> [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) 里的「浏览器 profile 被占用」。
+
+---
+
+## 两种部署形态
+
+TikTok 这类"由解析器在本机下好文件"的平台，交付方式取决于 NapCat 装在哪：
+
+| 形态 | NapCat 位置 | 需要的配置 | 交付方式 |
+|---|---|---|---|
+| **同机**（推荐家用） | 与解析器同一台 Windows | `allow_resolver_local_path: true` | 解析器回报 `local_path`，插件直接把该路径交给 NapCat（**零中转、最快**） |
+| **分离**（NapCat 上云） | 云服务器上 | `allow_resolver_local_path: false` | 解析器先把文件 `POST` 到插件的 `/resolver/upload`，插件再用 `/media/{token}` 交付 |
+
+抖音/小红书视频两种形态都一样：插件在服务器侧下载直链，再经临时链接交付。
+
+---
+
+## 配置（插件）
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `public_base_url` | `http://127.0.0.1:8022` | NapCat 访问 NekroAgent 的地址（不带 `/webui`） |
+| `max_file_size_mb` | `60` | 单个视频/图片体积上限 |
+| `expiry_minutes` | `30` | `/media/{token}` 临时链接有效期 |
+| `cooldown_seconds` | `3` | 同一聊天两次处理的间隔 |
+| `yt_dlp_path` | `/usr/local/bin/yt-dlp` | 小红书兜底（被重定向到登录页时）用的 yt-dlp 路径 |
+| `resolver_enabled` | `true` | 是否启用本地解析器 |
+| `resolver_token` | `""` | 解析器通信密钥（**必填**，与解析器 `config.json` 一致） |
+| `resolver_timeout` | `120` | 等解析器结果的最长时间（秒） |
+| `resolver_stale_seconds` | `60` | 多久没心跳算离线 |
+| `send_timeout` | `300` | 合并转发调用的超时（大视频上传慢，别太小） |
+| `max_images` | `9` | 图文笔记最多发送张数（1~20） |
+| `allow_resolver_local_path` | `false` | NapCat 与解析器同机时设为 `true` |
+| `forward_nickname` | `机器人` | 合并转发卡片里显示的昵称（发送者账号取自 `bot.self_id`） |
+
+## 配置（解析器）
+
+| 键 | 说明 |
+|---|---|
+| `server` | NekroAgent 地址，如 `http://1.2.3.4:8022` |
+| `token` | 与插件 `resolver_token` 一致 |
+| `browser` | Edge 可执行文件路径；留空自动查找 |
+| `proxy` | 浏览器代理（可选） |
+| `tiktokProxy` | TikTok 下载用的代理，如 `http://127.0.0.1:7897` |
+| `ytDlpPath` | yt-dlp 可执行文件路径（TikTok 下载用） |
+| `downloadDir` | 下载目录，默认脚本同目录 `downloads` |
+| `maxDownloadMb` / `keepHours` | 单文件上限 / 下载文件保留小时数 |
+| `maxUploadMb` | 上传到服务器的上限（分离形态用） |
+
+其余为超时与预热参数，默认值适用于家用宽带。
+
+---
+
+## 自检
+
+一条命令验证全链路（`<token>` 换成 `resolver_token`，`<url>` 换成目标链接）：
+
+```bash
+curl "http://<你的服务器>:8022/plugins/local_video.video_forward/resolver/self-test?token=<token>&url=<url>&download=true"
+```
+
+返回示例：
+
+```json
+{"ok":true,"platform":"douyin","video_count":11,"image_count":0,"downloaded_mb":4.9}
+{"ok":true,"platform":"xiaohongshu","mode":"images","image_count":5,"first_image_mb":0.05}
+{"ok":true,"platform":"tiktok","mode":"local_file","local_path":"C:\\media-resolver\\downloads\\tt_xxx.mp4",
+ "local_path_mode":"hand-to-napcat"}
+```
+
+---
+
+## 常见问题
+
+见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)，包括：
+
+- `浏览器进程在启动阶段就退出了`（profile 被残留 Edge 占用）
+- 抖音/小红书明明有直链却发不出（机房 IP 风控 → 必须走本地解析器）
+- `TikTok 需要解析器把文件上传到服务器`（部署形态配置错）
+- `正向Websocket消息` 看不到（NapCat 的 debug 开关）
+- TikTok 短链大小写导致 `Unsupported URL`
+
+---
+
+## 免责声明
+
+- 本项目仅供**个人学习与自用**，请遵守各平台的服务条款与所在地法律。
+- 请只处理**公开**内容；不支持也不应绕过付费、私密、仅好友可见或需要登录的内容。
+- 下载内容的使用需尊重原作者版权；转发到公开群聊前请自行确认授权与合规性。
+- 平台接口随时可能变化导致失效，作者不提供任何可用性保证。
+
+## 参与开发
+
+见 [CONTRIBUTING.md](CONTRIBUTING.md)。提交前请确认没有把 `config.yaml` / `config.json` / token 带进来（CI 有一道扫描会拦）。
+
+## License
+
+**PolyForm Noncommercial 1.0.0** —— 个人使用、修改、再分发都允许；**禁止任何商业用途**（包括把基于本项目的东西作为商品或服务提供给他人）。全文见 [LICENSE](LICENSE)。
+
+> ⚠️ 这不是 OSI 定义的开源许可，属于 source-available（源码可见）。如需商业授权，请联系作者。

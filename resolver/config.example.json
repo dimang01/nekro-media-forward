@@ -1,0 +1,21 @@
+{
+  "server": "http://1.2.3.4:8022",
+  "token": "CHANGE_ME_to_the_same_value_as_resolver_token",
+  "pluginPath": "/plugins/local_video.video_forward",
+  "browser": "",
+  "proxy": "",
+  "tiktokProxy": "http://127.0.0.1:7897",
+  "ytDlpPath": "",
+  "downloadDir": "",
+  "maxDownloadMb": 120,
+  "keepHours": 6,
+  "downloadTimeoutMs": 300000,
+  "pollWaitSeconds": 20,
+  "warmupMs": 8000,
+  "navTimeoutMs": 45000,
+  "retryDelayMs": 5000,
+  "callTimeoutMs": 20000,
+  "jobTimeoutMs": 120000,
+  "maxUploadMb": 120,
+  "uploadTimeoutMs": 900000
+}

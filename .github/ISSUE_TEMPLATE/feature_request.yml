@@ -1,0 +1,37 @@
+name: 功能建议
+description: 新平台、新形态、新配置项
+labels: [enhancement]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: 想要什么
+      description: 一句话说清，例如「支持 B 站」「图片直接发出来而不是合并转发」
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: 为什么需要
+      description: 使用场景；如果是新平台，请说明该平台是否有公开分享链接、是否需要登录/风控
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 涉及哪部分
+      options:
+        - 插件（plugin.py）
+        - 本地解析器（media-resolver）
+        - 文档
+        - 不确定
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: 约束确认
+      options:
+        - label: 该功能不需要绕过付费/私密/登录限制
+        - label: 可以接受"零第三方依赖"的实现约束

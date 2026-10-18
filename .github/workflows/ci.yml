@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  syntax:
+    name: 语法检查与凭据扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python 语法检查（plugin.py）
+        run: |
+          python3 -m py_compile plugin/plugin.py
+          echo "✅ py_compile OK"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Node 语法检查（解析器）
+        run: |
+          node --check resolver/resolver.js
+          node --check resolver/agent.js
+          echo "✅ node --check OK"
+
+      - name: 防止误提交真实凭据
+        run: |
+          fail=0
+          # 1) 真实配置文件不应入库（只提交 *.example.*）
+          if git ls-files | grep -E '(^|/)config\.(json|yaml)$'; then
+            echo "❌ 检测到真实配置文件被提交，请删除并只保留 *.example.*"
+            fail=1
+          fi
+          # 2) 占位符之外的 resolver_token 视为泄露
+          hits=$(grep -rnE 'resolver_token:[[:space:]]*"?[A-Za-z0-9_-]{16,}' --include='*.yaml' . || true)
+          echo "$hits" | grep -v 'CHANGE_ME' | grep . && { echo "❌ 检测到疑似真实 resolver_token"; fail=1; }
+          # 3) 常见隐私特征（内网/公网 IP 也可按需加白）
+          if grep -rnE '(dyr_[A-Za-z0-9]{16,})|(/home/ubuntu/srv/)' --include='*.py' --include='*.js' --include='*.md' . ; then
+            echo "❌ 代码/文档里出现疑似令牌或私有路径"
+            fail=1
+          fi
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "✅ 未发现凭据泄露"

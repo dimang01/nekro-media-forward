@@ -1,0 +1,20 @@
+# 真实配置文件（含密钥），绝不提交
+config.json
+config.yaml
+config.local.json
+.env
+*.env
+
+# 运行产物
+downloads/
+.browser-profile*/
+*.log
+__pycache__/
+*.pyc
+node_modules/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

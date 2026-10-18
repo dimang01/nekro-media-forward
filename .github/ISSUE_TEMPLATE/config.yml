@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 先看常见问题
+    url: https://github.com/maoxian1527-ops/nekro-media-forward/blob/main/docs/TROUBLESHOOTING.md
+    about: 浏览器 profile 被占、机房 IP 风控、本机路径/上传形态、TikTok 短链大小写等 8 类真实踩坑

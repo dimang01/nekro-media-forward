@@ -1,0 +1,67 @@
+name: Bug 报告
+description: 解析失败、发不出来、卡片是空的、报错等
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提之前请先看 [docs/TROUBLESHOOTING.md](../../blob/main/docs/TROUBLESHOOTING.md)。
+
+        ⚠️ **不要贴出** `resolver_token`、服务器 IP/域名、机器人 QQ 号等隐私信息（贴自检 JSON 时请先删掉 token）。
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 出问题的平台
+      options:
+        - 抖音（视频）
+        - 抖音（图文）
+        - 小红书（视频）
+        - 小红书（图文）
+        - TikTok
+
+        - 与平台无关（通用问题）
+    validations:
+      required: true
+
+  - type: dropdown
+    id: shape
+    attributes:
+      label: 部署形态
+      options:
+        - NapCat 与解析器同机（allow_resolver_local_path: true）
+        - NapCat 在云端（allow_resolver_local_path: false）
+        - 没装本地解析器（只跑插件）
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: 版本
+      placeholder: 插件 0.7.0 / NapCat 4.x / Windows 11 / NekroAgent 最新
+
+  - type: textarea
+    id: symptom
+    attributes:
+      label: 现象
+      description: 群里看到什么？自检接口返回什么？（记得删 token）
+      placeholder: |
+        例：发小红书链接后机器人回“视频未能发送：…”，自检返回 {"ok":false,"error":"…"}
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志
+      description: 插件日志关键字：解析器上传完成 / 使用本机文件 / 抖音直链下载 / 图文发送 / 短视频转发失败；解析器侧看 resolver.log
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 自检
+      options:
+        - label: 已确认 `GET /plugins/local_video.video_forward/` 返回 `"resolver":{"online":true}`
+        - label: 已阅读 TROUBLESHOOTING 里对应现象
