@@ -717,35 +717,62 @@ async function downloadTiktok(config, rawUrl) {
   const proxy = config.tiktokProxy || config.proxy || '';
   const maxMb = Number(config.maxDownloadMb || 120);
   const outputTemplate = path.join(downloadDir, 'tt_%(id)s.%(ext)s');
-  const args = [
-    '--no-warnings',
-    '--no-progress',
-    '--no-playlist',
-    '--no-simulate',
-    '--restrict-filenames',
-    '--max-filesize',
-    `${maxMb}M`,
-    '-f',
-    config.tiktokFormat || 'b[ext=mp4]/b',
-    '-o',
-    outputTemplate,
-    '--print',
-    'after_move:%(id)s\t%(title)s\t%(duration)s\t%(filesize)s\t%(filepath)s',
-  ];
-  if (proxy) args.push('--proxy', proxy);
-  args.push(rawUrl);
 
-  log(`TikTok 下载：${binary}${proxy ? ` (proxy=${proxy})` : ' (未配置代理)'}`);
-  const { code, stdout, stderr } = await runYtDlp(binary, args, Number(config.downloadTimeoutMs || 300000));
+  const buildArgs = (useProxy) => {
+    const list = [
+      '--no-warnings',
+      '--no-progress',
+      '--no-playlist',
+      '--no-simulate',
+      '--restrict-filenames',
+      '--max-filesize',
+      `${maxMb}M`,
+      '-f',
+      config.tiktokFormat || 'b[ext=mp4]/b',
+      '-o',
+      outputTemplate,
+      '--print',
+      'after_move:%(id)s\t%(title)s\t%(duration)s\t%(filesize)s\t%(filepath)s',
+    ];
+    if (useProxy) list.push('--proxy', useProxy);
+    list.push(rawUrl);
+    return list;
+  };
 
-  if (code !== 0) {
-    const detail = (stderr || stdout).trim().split('\n').filter(Boolean).slice(-1)[0] || 'yt-dlp 执行失败';
+  // TikTok 偶尔会因为限流 / 指纹校验返回 403，属于瞬时错误：
+  // 依次尝试「代理 → 代理（等 4 秒）→ 直连」，全部失败才报错。
+  const plans = proxy
+    ? [{ proxy, wait: 0 }, { proxy, wait: 4000 }, { proxy: '', wait: 4000 }]
+    : [{ proxy: '', wait: 0 }, { proxy: '', wait: 4000 }];
+
+  let stdout = '';
+  let lastDetail = '';
+  for (const [index, plan] of plans.entries()) {
+    if (plan.wait) await sleep(plan.wait);
+    log(`TikTok 下载（第 ${index + 1}/${plans.length} 次）${plan.proxy ? ` proxy=${plan.proxy}` : ' 直连'}`);
+    const result = await runYtDlp(
+      binary,
+      buildArgs(plan.proxy),
+      Number(config.downloadTimeoutMs || 300000),
+    );
+    if (result.code === 0) {
+      stdout = result.stdout;
+      break;
+    }
+    lastDetail =
+      (result.stderr || result.stdout).trim().split('\n').filter(Boolean).slice(-1)[0] ||
+      'yt-dlp 执行失败';
+    log(`TikTok 第 ${index + 1} 次失败：${lastDetail.slice(0, 160)}`);
+  }
+
+  if (!stdout) {
+    const hint = proxy
+      ? '（已自动重试 3 次，仍是瞬时错误，请稍后再发一次）'
+      : '（当前未配置 tiktokProxy，TikTok 通常需要代理）';
     return {
       ok: false,
       platform: 'tiktok',
-      error: proxy
-        ? `TikTok 下载失败：${detail.slice(0, 200)}`
-        : `TikTok 需要代理才能访问（当前未配置 tiktokProxy）：${detail.slice(0, 160)}`,
+      error: `TikTok 下载失败${hint}：${lastDetail.slice(0, 200)}`,
     };
   }
 
