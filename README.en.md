@@ -5,11 +5,14 @@
 
 中文说明见 [README.md](README.md)。
 
-Auto-detect (Bilibili supports 1080p/4K via the public API plus ffmpeg merging; no local resolver needed.) **Douyin (抖音) / Xiaohongshu (小红书) / TikTok / Bilibili (B站)** links in QQ messages and
+Auto-detect **Douyin (抖音) / Xiaohongshu (小红书) / TikTok / Bilibili (B站)** links in QQ messages and
 re-send the media as a QQ **merged forward** (合并转发) card.
 
 - **Zero third-party dependencies** — the plugin is a single Python file; the resolver is a single
   Node.js file that only uses the standard library plus the system Edge browser.
+- **Bilibili needs neither** — it goes straight to the public `api.bilibili.com` endpoints from the
+  server (`view` + wbi-signed `playurl`), and merges DASH video/audio with ffmpeg, giving 1080p/4K
+  once a login cookie is configured (see `tools/bilibili-qr-login.sh`).
 - **Doesn't interrupt the conversation** — link messages are handled by the plugin and the AI trigger
   is blocked, so the bot doesn't reply with small talk on top of the video.
 - **Residential-IP resolution** — datacenter IPs are blocked by Douyin/Xiaohongshu anti-bot. The
