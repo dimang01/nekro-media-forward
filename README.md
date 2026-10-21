@@ -36,10 +36,25 @@
 | 匿名（`bilibili_cookie` 留空） | **720p** | 单文件 mp4（`fnval=1`），不需要 ffmpeg |
 | 已登录（填了 `SESSDATA`） | **1080p / 4K** | DASH（`fnval=4048`）+ ffmpeg 合并音视频 |
 
+**登录怎么弄（推荐）**：跑一次 `sudo ./tools/bilibili-qr-login.sh` —— 它会在服务器上生成登录二维码，
+手机 B 站 App 扫码确认后，自动把 `SESSDATA` / `bili_jct` / `DedeUserID` / `DedeUserID__ckMd5`
+写进插件配置并重启容器。比手动从浏览器复制 Cookie 可靠得多（少字段、YAML 折行都会导致登录失效）。
+
 > 有意思的细节：B 站**匿名用户的 DASH 只给 480p**，而单文件 mp4 能到 720p。
 > 所以插件会先看 DASH 能到多高，**只有达到 1080p 才走 DASH 合并**，否则退回 mp4 —— 保证匿名也有 720p。
 
-拿 `SESSDATA`：浏览器登录 bilibili.com → F12 → Application → Storage → Cookies → `https://www.bilibili.com` → 复制 `SESSDATA` 的值（建议用小号，登录态会交给服务器上的插件）。
+拿 `SESSDATA`（手动方式）：浏览器登录 bilibili.com → F12 → Application → Storage → Cookies →
+`https://www.bilibili.com` → 复制 `SESSDATA` 的值（建议用小号，登录态会交给服务器上的插件）。
+
+> 技术细节：B 站的非签名接口 `x/player/playurl` **只返回匿名画质**（DASH 最高 480p、单文件 mp4 最高 720p），
+> 1080p+ 必须走 `x/player/wbi/playurl` 并带 `w_rid` / `wts` 签名。插件已内置 wbi 签名（见 `_BilibiliWbi`）。
+
+实测（云端、同一视频 BV1GJ411x7h7）：
+
+| 状态 | 解析结果 |
+|---|---|
+| 匿名 | `mode=direct_url`，720p，49.57 MB |
+| 登录后 | `mode=dash`，**1080p**，`merged=true`，71.75 MB |
 
 - B 站：机房 IP 访问网页会被风控（HTTP 412），所以改走 `api.bilibili.com` 的公开接口
   （`view` 拿 cid + `playurl` 的 `fnval=1` 直接返回单文件 mp4），因此 **B 站不需要本地解析器**；

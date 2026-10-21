@@ -22,6 +22,7 @@ import asyncio
 import mimetypes
 import os
 import re
+import hashlib
 import secrets
 import shutil
 import time
@@ -29,7 +30,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -47,7 +48,7 @@ plugin = NekroPlugin(
     name="短视频合并转发",
     module_name="video_forward",
     description="收到公开的抖音 / 小红书 / TikTok / B站 视频链接后，将视频以 QQ 合并转发发回原聊天。抖音与小红书由本地解析器取直链，B站走公开 API。",
-    version="0.8.1",
+    version="0.9.0",
     author="local_video",
     url="https://github.com/KroMiose/nekro-agent",
     support_adapter=["onebot_v11"],
@@ -577,6 +578,38 @@ async def _run_ytdlp(url: str, task_dir: Path) -> tuple[Path, str]:
 #   x/player/playurl      → fnval=1 直接返回「单文件 mp4」直链，不需要 ffmpeg 合并音视频
 # 所以 B 站不需要本地解析器，云端直连即可（未登录时 B 站只会给到 720p/480p）。
 
+# B 站 wbi 签名：非签名接口（x/player/playurl）只返回匿名画质（最高 480p 的 DASH），
+# 1080p / 4K 必须走 x/player/wbi/playurl 并带上 w_rid / wts 签名。
+_BILI_MIXIN_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+]
+
+
+class _BilibiliWbi:
+    """wbi 签名器：用 nav 接口里的 img_key / sub_key 按固定表混排出 mixin_key。"""
+
+    def __init__(self) -> None:
+        self.mixin_key = ""
+
+    def refresh(self, img_url: str, sub_url: str) -> str:
+        img_key = str(img_url).rsplit("/", 1)[-1].split(".")[0]
+        sub_key = str(sub_url).rsplit("/", 1)[-1].split(".")[0]
+        raw = img_key + sub_key
+        self.mixin_key = "".join(raw[i] for i in _BILI_MIXIN_TAB if i < len(raw))[:32]
+        return self.mixin_key
+
+    def sign(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        signed = {key: value for key, value in params.items() if value is not None}
+        signed["wts"] = int(time.time())
+        query = urlencode(sorted(signed.items()), safe="")
+        query = re.sub(r"[!'()*]", "", query)
+        signed["w_rid"] = hashlib.md5((query + self.mixin_key).encode()).hexdigest()
+        return signed
+
+
 _BILI_QUALITY_LABELS = {
     6: "240p",
     16: "360p",
@@ -777,16 +810,42 @@ async def _resolve_bilibili(url: str, force_mp4: bool = False) -> Dict[str, Any]
         # 有 ffmpeg 就走 DASH（1080p/4K）；否则退回单文件 mp4（匿名最高 720p）
         ffmpeg_path = "" if force_mp4 else _bilibili_ffmpeg()
         fnval = 4048 if ffmpeg_path else 1
-        play = await client.get(
-            "https://api.bilibili.com/x/player/playurl",
-            params={
-                "bvid": data.get("bvid") or ids["bvid"],
-                "cid": cid,
-                "qn": 120,
-                "fnval": fnval,
-                "fourk": 1,
-            },
-        )
+
+        # 取 wbi 签名 key（nav 同时会告诉我们 cookie 是否被 B 站认作已登录）
+        wbi = _BilibiliWbi()
+        try:
+            nav = await client.get("https://api.bilibili.com/x/web-interface/nav")
+            nav_data = (nav.json() or {}).get("data") or {}
+            wbi_data = nav_data.get("wbi_img") or {}
+            if wbi_data.get("img_url") and wbi_data.get("sub_url"):
+                wbi.refresh(str(wbi_data["img_url"]), str(wbi_data["sub_url"]))
+                plugin.logger.info(
+                    "B站 wbi 就绪（登录态：%s）"
+                    % (
+                        "已登录，可用 1080p+"
+                        if nav_data.get("isLogin")
+                        else "未登录，最高 480p DASH / 720p mp4"
+                    )
+                )
+        except Exception as error:  # noqa: BLE001 - 拿不到 wbi key 就退回未签名接口
+            plugin.logger.warning(f"B站 wbi key 获取失败：{error}")
+
+        play_params: Dict[str, Any] = {
+            "bvid": data.get("bvid") or ids["bvid"],
+            "cid": cid,
+            "qn": 120,
+            "fnval": fnval,
+            "fnver": 0,
+            "fourk": 1,
+        }
+        if wbi.mixin_key:
+            play = await client.get(
+                "https://api.bilibili.com/x/player/wbi/playurl", params=wbi.sign(play_params)
+            )
+        else:
+            play = await client.get(
+                "https://api.bilibili.com/x/player/playurl", params=play_params
+            )
         play.raise_for_status()
         play_payload = play.json()
         if play_payload.get("code") != 0:
@@ -1267,8 +1326,19 @@ def create_router() -> APIRouter:
         """Small deployment check; it exposes no configuration or media."""
         return {
             "name": "video_forward",
-            "version": "0.8.1",
+            "version": "0.9.0",
             "supported": ["douyin", "xiaohongshu", "tiktok", "bilibili"],
+            "bilibili": {
+                "cookie": bool(
+                    str(getattr(plugin.get_config(), "bilibili_cookie", "") or "").strip()
+                ),
+                "ffmpeg": bool(_bilibili_ffmpeg()),
+                "quality_hint": (
+                    "cookie 已配置：DASH 可达 1080p+/4K（走 ffmpeg 合并）"
+                    if str(getattr(plugin.get_config(), "bilibili_cookie", "") or "").strip()
+                    else "cookie 为空：匿名只能 720p（单文件 mp4）"
+                ),
+            },
             "resolver": {
                 "enabled": bool(plugin.get_config().resolver_enabled),
                 "configured": bool(_resolver_token()),
