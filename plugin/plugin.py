@@ -166,6 +166,15 @@ class VideoForwardConfig(ConfigBase):
             "超过上限不会发送，并会提示视频的实际大小。"
         ),
     )
+    bilibili_cookie: str = Field(
+        default="",
+        title="B站 Cookie（可选，用于登录态）",
+        description=(
+            "留空 = 匿名访问（B 站只给到 720p，会员/登录可见视频会失败）。"
+            "填浏览器里 bilibili.com 的 SESSDATA 值即可（也可以粘整行 Cookie）。"
+            "注意：这相当于把账号登录态交给服务器上的插件，请自行评估风险，别用主账号。"
+        ),
+    )
 
 
 _SUPPORTED_DOMAINS = (
@@ -608,7 +617,11 @@ async def _expand_bilibili_url(url: str) -> str:
 
 async def _resolve_bilibili(url: str) -> Dict[str, Any]:
     """取 B 站视频的元信息 + 单文件 mp4 直链（不需要登录、不需要 ffmpeg）。"""
+    cookie = str(getattr(plugin.get_config(), "bilibili_cookie", "") or "").strip()
     headers = {"User-Agent": _DOWNLOAD_UA, "Referer": "https://www.bilibili.com/"}
+    if cookie:
+        # 允许只填 SESSDATA 的值，也允许直接粘整行 Cookie
+        headers["Cookie"] = cookie if "=" in cookie else f"SESSDATA={cookie}"
     try:
         expanded = await _expand_bilibili_url(url)
     except Exception as error:  # noqa: BLE001 - 短链跳转失败时退回原链接
