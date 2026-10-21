@@ -39,9 +39,15 @@ jobs:
           # 2) 占位符之外的 resolver_token 视为泄露
           hits=$(grep -rnE 'resolver_token:[[:space:]]*"?[A-Za-z0-9_-]{16,}' --include='*.yaml' . || true)
           echo "$hits" | grep -v 'CHANGE_ME' | grep . && { echo "❌ 检测到疑似真实 resolver_token"; fail=1; }
-          # 3) 常见隐私特征（内网/公网 IP 也可按需加白）
-          if grep -rnE '(dyr_[A-Za-z0-9]{16,})|(/home/ubuntu/srv/)' --include='*.py' --include='*.js' --include='*.md' . ; then
-            echo "❌ 代码/文档里出现疑似令牌或私有路径"
+          # 3) 常见令牌/密钥特征（注意：不要把安装路径当凭据，路径本身不是秘密）
+          if grep -rnE '(dyr_[A-Za-z0-9]{16,})|(ghp_[A-Za-z0-9]{20,})|(github_pat_[A-Za-z0-9_]{20,})|(sk-[A-Za-z0-9]{20,})|(-----BEGIN [A-Z ]*PRIVATE KEY-----)' \
+               --include='*.py' --include='*.js' --include='*.md' --include='*.sh' --include='*.yaml' . ; then
+            echo "❌ 代码/文档里出现疑似令牌或私钥"
+            fail=1
+          fi
+          # 4) 真实的 B 站登录态（SESSDATA 后面跟长值才算泄露，文档里的 SESSDATA=... 不算）
+          if grep -rnE 'SESSDATA=[A-Za-z0-9%_.,-]{30,}' --include='*.py' --include='*.js' --include='*.md' --include='*.sh' --include='*.yaml' . ; then
+            echo "❌ 检测到疑似真实 SESSDATA"
             fail=1
           fi
           if [ "$fail" -ne 0 ]; then exit 1; fi
