@@ -15,6 +15,9 @@ re-send the media as a QQ **merged forward** (合并转发) card.
 - **Residential-IP resolution** — datacenter IPs are blocked by Douyin/Xiaohongshu anti-bot. The
   resolver runs on your home PC and drives a real headless browser, then hands back direct URLs.
 - **Polls outbound** — the resolver works behind NAT; your server never needs to reach the home PC.
+- **Bilibili supported** — the public `api.bilibili.com` endpoints are used (`view` for cid,
+  `playurl` with `fnval=1` for a single-file mp4), because datacenter IPs get HTTP 412 from the web
+  pages. So **Bilibili needs neither the local resolver nor ffmpeg**; without login it caps at 720p.
 - **Image posts supported** — Xiaohongshu/Douyin image notes are delivered as one merged card with
   up to `max_images` (default 9) images.
 

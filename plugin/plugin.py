@@ -46,8 +46,8 @@ from nekro_agent.api.signal import MsgSignal
 plugin = NekroPlugin(
     name="短视频合并转发",
     module_name="video_forward",
-    description="收到公开的抖音、小红书或 TikTok 视频链接后，将视频以 QQ 合并转发发回原聊天。抖音与小红书由本地解析器取直链。",
-    version="0.7.1",
+    description="收到公开的抖音 / 小红书 / TikTok / B站 视频链接后，将视频以 QQ 合并转发发回原聊天。抖音与小红书由本地解析器取直链，B站走公开 API。",
+    version="0.8.0",
     author="local_video",
     url="https://github.com/KroMiose/nekro-agent",
     support_adapter=["onebot_v11"],
@@ -92,7 +92,7 @@ class VideoForwardConfig(ConfigBase):
     )
     resolver_enabled: bool = Field(
         default=True,
-        title="启用本地解析器（抖音 / 小红书 / TikTok）",
+        title="启用本地解析器（抖音 / 小红书 / TikTok；B站不需要）",
         description=(
             "抖音和小红书的 web 接口有风控且会拦截机房 IP，必须由住宅网络里的本地解析器"
             "（media-resolver）用真实浏览器取直链；TikTok 在大陆被墙、云端完全不可达，"
@@ -156,6 +156,16 @@ class VideoForwardConfig(ConfigBase):
         title="合并转发显示的昵称",
         description="合并转发卡片里显示的发送者昵称，默认「机器人」。",
     )
+    bilibili_max_size_mb: int = Field(
+        default=300,
+        ge=10,
+        le=1500,
+        title="B站视频体积上限（MB）",
+        description=(
+            "B 站视频普遍比短视频大，单独给一个上限（默认 300MB）。"
+            "超过上限不会发送，并会提示视频的实际大小。"
+        ),
+    )
 
 
 _SUPPORTED_DOMAINS = (
@@ -165,7 +175,8 @@ _SUPPORTED_DOMAINS = (
     "xhslink.com",
     "xhslink.cn",
     "tiktok.com",
-
+    "bilibili.com",
+    "b23.tv",
 )
 # 需要本地解析器处理的平台
 # 抖音 / 小红书：风控 + 机房 IP 拦截，必须住宅 IP + 真实浏览器取直链
@@ -182,12 +193,13 @@ _DOWNLOAD_REFERER = {
     "douyin": "https://www.douyin.com/",
     "xiaohongshu": "https://www.xiaohongshu.com/",
     "tiktok": "https://www.tiktok.com/",
+    "bilibili": "https://www.bilibili.com/",
 }
 # QQ 分享文案有时会把短链和标题拆成不同消息段，甚至省去 https://。
 # 因此只找受支持站点，而不是依赖整段消息恰好是一个标准 URL。
 _URL_RE = re.compile(
     r"(?:(?:https?://)?(?:[a-z0-9-]+\.)*(?:douyin\.com|iesdouyin\.com|"
-    r"xiaohongshu\.com|xhslink\.(?:com|cn)|tiktok\.com)"
+    r"xiaohongshu\.com|xhslink\.(?:com|cn)|tiktok\.com|bilibili\.com|b23\.tv)"
     r"(?:/[^\s<>'\"，。！？、]*)?)",
     re.IGNORECASE,
 )
@@ -202,7 +214,7 @@ _DOWNLOAD_UA = (
 )
 
 
-_PLATFORM_NAMES = {"douyin": "抖音", "xiaohongshu": "小红书", "tiktok": "TikTok"}
+_PLATFORM_NAMES = {"douyin": "抖音", "xiaohongshu": "小红书", "tiktok": "TikTok", "bilibili": "B站"}
 
 
 @dataclass
@@ -380,6 +392,8 @@ def _source_name(url: str) -> str:
         return "小红书"
     if "tiktok" in host:
         return "TikTok"
+    if "bilibili" in host or "b23.tv" in host:
+        return "B站"
     return "未知平台"
 
 
@@ -539,6 +553,176 @@ async def _run_ytdlp(url: str, task_dir: Path) -> tuple[Path, str]:
     return video, video.name
 
 
+# ---------------------------------------------------------------- B 站
+# 机房 IP 访问 bilibili 网页会被风控（HTTP 412），但公开 API 正常：
+#   x/web-interface/view  → 标题 / cid / 时长 / 分P
+#   x/player/playurl      → fnval=1 直接返回「单文件 mp4」直链，不需要 ffmpeg 合并音视频
+# 所以 B 站不需要本地解析器，云端直连即可（未登录时 B 站只会给到 720p/480p）。
+
+_BILI_QUALITY_LABELS = {
+    6: "240p",
+    16: "360p",
+    32: "480p",
+    64: "720p",
+    74: "720p60",
+    80: "1080p",
+    112: "1080p+",
+    116: "1080p60",
+    120: "4K",
+    125: "HDR",
+    126: "杜比视界",
+}
+
+
+def _is_bilibili(url: str) -> bool:
+    host = _host_of(url)
+    return any(host == domain or host.endswith("." + domain) for domain in ("bilibili.com", "b23.tv"))
+
+
+def _bilibili_ids(url: str) -> Dict[str, Any]:
+    """从链接里取出 bvid / aid / 分P 页码。"""
+    match = re.search(r"(BV[0-9A-Za-z]{10})", url)
+    bvid = match.group(1) if match else ""
+    match_av = re.search(r"/av(\d+)", url, re.IGNORECASE)
+    aid = match_av.group(1) if match_av else ""
+    page = 1
+    match_page = re.search(r"[?&]p=(\d+)", url)
+    if match_page:
+        try:
+            page = max(1, int(match_page.group(1)))
+        except ValueError:
+            page = 1
+    return {"bvid": bvid, "aid": aid, "page": page}
+
+
+async def _expand_bilibili_url(url: str) -> str:
+    """b23.tv 短链 → 跟随跳转拿完整链接。"""
+    if "b23.tv" not in _host_of(url):
+        return url
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
+        response = await client.get(
+            url, headers={"User-Agent": _DOWNLOAD_UA, "Referer": "https://www.bilibili.com/"}
+        )
+        return str(response.url)
+
+
+async def _resolve_bilibili(url: str) -> Dict[str, Any]:
+    """取 B 站视频的元信息 + 单文件 mp4 直链（不需要登录、不需要 ffmpeg）。"""
+    headers = {"User-Agent": _DOWNLOAD_UA, "Referer": "https://www.bilibili.com/"}
+    try:
+        expanded = await _expand_bilibili_url(url)
+    except Exception as error:  # noqa: BLE001 - 短链跳转失败时退回原链接
+        plugin.logger.warning(f"B站短链展开失败（使用原链接继续）：{error}")
+        expanded = url
+
+    ids = _bilibili_ids(expanded)
+    if not ids["bvid"] and not ids["aid"]:
+        if re.search(r"/(bangumi|cheese)/play/", expanded):
+            return {
+                "ok": False,
+                "platform": "bilibili",
+                "error": "番剧 / 课程需要登录 Cookie，本插件暂不支持，请发普通投稿视频链接。",
+            }
+        return {
+            "ok": False,
+            "platform": "bilibili",
+            "error": f"没能从链接里认出 BV 号（链接：{expanded[:100]}）。",
+        }
+
+    params = {"bvid": ids["bvid"]} if ids["bvid"] else {"aid": ids["aid"]}
+    async with httpx.AsyncClient(headers=headers, timeout=25) as client:
+        view = await client.get("https://api.bilibili.com/x/web-interface/view", params=params)
+        view.raise_for_status()
+        payload = view.json()
+        if payload.get("code") != 0:
+            return {
+                "ok": False,
+                "platform": "bilibili",
+                "error": f"B站接口返回 {payload.get('code')}：{payload.get('message')}",
+            }
+        data = payload.get("data") or {}
+        pages = data.get("pages") or []
+        page_index = min(max(1, ids["page"]), len(pages) or 1) - 1
+        page_info = pages[page_index] if pages else {}
+        cid = page_info.get("cid")
+        if not cid:
+            return {
+                "ok": False,
+                "platform": "bilibili",
+                "error": "B站接口没有返回 cid（视频可能已删除或仅会员可见）。",
+            }
+
+        play = await client.get(
+            "https://api.bilibili.com/x/player/playurl",
+            params={
+                "bvid": data.get("bvid") or ids["bvid"],
+                "cid": cid,
+                "qn": 112,
+                "fnval": 1,
+                "fourk": 1,
+            },
+        )
+        play.raise_for_status()
+        play_payload = play.json()
+        if play_payload.get("code") != 0:
+            return {
+                "ok": False,
+                "platform": "bilibili",
+                "error": (
+                    f"B站播放接口返回 {play_payload.get('code')}：{play_payload.get('message')}"
+                    "（部分视频需要登录或仅限特定地区）"
+                ),
+            }
+
+        play_data = play_payload.get("data") or {}
+        segments = play_data.get("durl") or []
+        if not segments:
+            return {
+                "ok": False,
+                "platform": "bilibili",
+                "error": "B站没有返回单文件 mp4 直链（这类视频通常需要登录才能取到 DASH 流）。",
+            }
+        if len(segments) > 1:
+            return {
+                "ok": False,
+                "platform": "bilibili",
+                "error": f"这条视频被切成了 {len(segments)} 段，需要 ffmpeg 合并，暂不支持。",
+            }
+
+        segment = segments[0]
+        quality = play_data.get("quality")
+        try:
+            label = _BILI_QUALITY_LABELS.get(int(quality), f"quality-{quality}")
+        except (TypeError, ValueError):
+            label = "未知清晰度"
+
+        total_pages = len(pages)
+        title = str(data.get("title") or "").strip()
+        if total_pages > 1:
+            title = f"{title}（P{page_index + 1}/{total_pages}）"
+
+        plugin.logger.info(
+            f"B站解析：{title[:40]} 清晰度={label} 体积={_human_size(segment.get('size'))}"
+        )
+        return {
+            "ok": True,
+            "platform": "bilibili",
+            "mode": "direct_url",
+            "title": title,
+            "aweme_id": data.get("bvid") or ids["bvid"] or ids["aid"],
+            "duration_ms": int(page_info.get("duration") or data.get("duration") or 0) * 1000,
+            "cover": data.get("pic"),
+            "videos": [
+                {
+                    "label": label,
+                    "url": segment.get("url"),
+                    "size": segment.get("size"),
+                    "quality": quality,
+                }
+            ],
+        }
+
+
 async def _obtain_video(url: str, task_dir: Path) -> "_MediaSource":
     """拿到可发送的视频。
 
@@ -553,6 +737,22 @@ async def _obtain_video(url: str, task_dir: Path) -> "_MediaSource":
     config = plugin.get_config()
     max_bytes = int(config.max_file_size_mb) * 1024 * 1024
     platform = _platform_of(url)
+
+    # B 站：走公开 API 拿单文件 mp4 直链，云端直接下载（不需要本地解析器，也不需要 ffmpeg）
+    if _is_bilibili(url):
+        resolved_bili = await _resolve_bilibili(url)
+        if not resolved_bili.get("ok"):
+            raise RuntimeError(str(resolved_bili.get("error") or "B站解析失败"))
+        bili_limit = int(getattr(config, "bilibili_max_size_mb", 300) or 300) * 1024 * 1024
+        picked = _pick_stream(resolved_bili.get("videos") or [], bili_limit)
+        if not picked:
+            raise RuntimeError("B站没有返回可用的视频直链。")
+        if picked.get("size") and int(picked["size"]) > bili_limit:
+            raise RuntimeError(
+                f"B站视频 {_human_size(picked['size'])} 超过 {_human_size(bili_limit)} 上限，未发送。"
+                "可在插件配置里调大「B站视频体积上限」。"
+            )
+        return await _download_resolved(resolved_bili, "bilibili", task_dir, bili_limit)
 
     if platform and bool(config.resolver_enabled):
         resolved: Optional[Dict[str, Any]] = None
@@ -816,10 +1016,10 @@ async def auto_forward_video(ctx: AgentCtx, message: ChatMessage) -> MsgSignal |
     description="下载公开的抖音、小红书、TikTok 视频链接，并以 QQ 合并转发发送到当前聊天。不支持 B 站、付费、私密或受保护视频。",
 )
 async def forward_video(ctx: AgentCtx, url: str) -> str:
-    """当用户明确要求解析短视频时调用；参数必须是公开的抖音、小红书或 TikTok 链接。"""
+    """当用户明确要求解析短视频时调用；参数必须是公开的抖音、小红书、TikTok 或 B站 链接。"""
     candidate = _find_supported_url(url)
     if not candidate:
-        return "只支持公开的抖音、小红书和 TikTok 链接；B 站不在本插件范围内。"
+        return "只支持公开的抖音、小红书、TikTok 和 B站 视频链接。"
     return await _process(ctx, candidate)
 
 
@@ -864,8 +1064,8 @@ def create_router() -> APIRouter:
         """Small deployment check; it exposes no configuration or media."""
         return {
             "name": "video_forward",
-            "version": "0.7.1",
-            "supported": ["douyin", "xiaohongshu", "tiktok"],
+            "version": "0.8.0",
+            "supported": ["douyin", "xiaohongshu", "tiktok", "bilibili"],
             "resolver": {
                 "enabled": bool(plugin.get_config().resolver_enabled),
                 "configured": bool(_resolver_token()),
@@ -927,15 +1127,22 @@ def create_router() -> APIRouter:
         if not _resolver_authorized(token):
             raise HTTPException(status_code=403, detail="解析器密钥不正确")
         target_url = (url or "").strip() or "https://www.douyin.com/video/7684314365076960202"
-        if not _needs_local_resolver(target_url):
-            return {"ok": False, "error": "自检只支持抖音 / 小红书 / TikTok 链接"}
-        if not _resolver_online():
-            return {"ok": False, "error": "本地解析器未连接（没有收到心跳）"}
         started = time.time()
-        try:
-            resolved = await _resolve_via_local(target_url)
-        except Exception as error:  # noqa: BLE001 - 自检需要看到原始错误
-            return {"ok": False, "error": str(error)}
+        if _is_bilibili(target_url):
+            # B 站不需要本地解析器：走公开 API 拿单文件 mp4 直链
+            try:
+                resolved = await _resolve_bilibili(target_url)
+            except Exception as error:  # noqa: BLE001 - 自检需要看到原始错误
+                return {"ok": False, "error": str(error)}
+        else:
+            if not _needs_local_resolver(target_url):
+                return {"ok": False, "error": "自检只支持 抖音 / 小红书 / TikTok / B站 链接"}
+            if not _resolver_online():
+                return {"ok": False, "error": "本地解析器未连接（没有收到心跳）"}
+            try:
+                resolved = await _resolve_via_local(target_url)
+            except Exception as error:  # noqa: BLE001 - 自检需要看到原始错误
+                return {"ok": False, "error": str(error)}
         report: Dict[str, Any] = {
             "ok": bool(resolved.get("ok")),
             "platform": resolved.get("platform") or _platform_of(target_url),
@@ -997,7 +1204,14 @@ def create_router() -> APIRouter:
                 shutil.rmtree(task_dir, ignore_errors=True)
             return report
         if download and resolved.get("ok"):
+            platform_key = str(resolved.get("platform") or _platform_of(target_url) or "douyin")
             max_bytes = int(plugin.get_config().max_file_size_mb) * 1024 * 1024
+            if platform_key == "bilibili":
+                max_bytes = (
+                    int(getattr(plugin.get_config(), "bilibili_max_size_mb", 300) or 300)
+                    * 1024
+                    * 1024
+                )
             picked = _pick_stream(resolved.get("videos") or [], max_bytes)
             if picked:
                 task_dir = _VIDEO_DIR / f"selftest-{int(time.time())}"
@@ -1010,7 +1224,7 @@ def create_router() -> APIRouter:
                         {
                             "User-Agent": _DOWNLOAD_UA,
                             "Referer": _DOWNLOAD_REFERER.get(
-                                _platform_of(target_url) or "douyin", "https://www.douyin.com/"
+                                platform_key, "https://www.douyin.com/"
                             ),
                         },
                     )

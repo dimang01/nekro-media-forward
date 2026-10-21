@@ -29,6 +29,9 @@ send_timeout: 300
 # 图文笔记最多发送张数（1~20）
 max_images: 9
 
+# B 站视频体积上限（MB）：B 站视频通常更大，单独设一个上限
+bilibili_max_size_mb: 300
+
 # NapCat 与解析器同一台机器时设为 true（TikTok 走本机路径直传，零中转）
 # NapCat 在云端时保持 false（改由解析器上传文件）
 allow_resolver_local_path: false
