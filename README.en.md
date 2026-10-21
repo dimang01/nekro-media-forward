@@ -5,7 +5,7 @@
 
 中文说明见 [README.md](README.md)。
 
-Auto-detect **Douyin (抖音) / Xiaohongshu (小红书) / TikTok ** links in QQ messages and
+Auto-detect (Bilibili supports 1080p/4K via the public API plus ffmpeg merging; no local resolver needed.) **Douyin (抖音) / Xiaohongshu (小红书) / TikTok / Bilibili (B站)** links in QQ messages and
 re-send the media as a QQ **merged forward** (合并转发) card.
 
 - **Zero third-party dependencies** — the plugin is a single Python file; the resolver is a single

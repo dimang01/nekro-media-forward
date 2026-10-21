@@ -8,7 +8,8 @@
 
 把 抖音 / 小红书 / TikTok  的公开视频链接，自动解析并以 QQ **合并转发**发回原聊天。
 为 [NekroAgent](https://github.com/KroMiose/nekro-agent) + OneBot v11 / NapCat 设计，附带一个可选的
-**本地解析器（media-resolver）**，用来处理机房 IP 拿不到的抖音/小红书直链，以及必须走代理的 TikTok。
+**本地解析器（media-resolver）**，用来处理机房 IP 拿不到的抖音/小红书直链，以及必须走代理的 TikTok；
+B 站不需要解析器 —— 云端直连公开 API 即可（支持 1080p / 4K，见下文）。
 
 - **零第三方依赖**：插件是单文件 Python（只用 NekroAgent 自带能力），解析器是单文件 Node.js（只用标准库 + 系统里的 Edge）
 - **不打断聊天**：链接消息由插件直接处理并阻断 AI 触发，不会让机器人"再回一句"
