@@ -47,7 +47,7 @@ plugin = NekroPlugin(
     name="短视频合并转发",
     module_name="video_forward",
     description="收到公开的抖音 / 小红书 / TikTok / B站 视频链接后，将视频以 QQ 合并转发发回原聊天。抖音与小红书由本地解析器取直链，B站走公开 API。",
-    version="0.8.0",
+    version="0.8.1",
     author="local_video",
     url="https://github.com/KroMiose/nekro-agent",
     support_adapter=["onebot_v11"],
@@ -173,6 +173,15 @@ class VideoForwardConfig(ConfigBase):
             "留空 = 匿名访问（B 站只给到 720p，会员/登录可见视频会失败）。"
             "填浏览器里 bilibili.com 的 SESSDATA 值即可（也可以粘整行 Cookie）。"
             "注意：这相当于把账号登录态交给服务器上的插件，请自行评估风险，别用主账号。"
+        ),
+    )
+    bilibili_ffmpeg_path: str = Field(
+        default="",
+        title="B站 ffmpeg 路径（可选）",
+        description=(
+            "合并 DASH 音视频需要 ffmpeg（1080p / 4K 必须走这条路）。"
+            "留空时自动查找 /home/ubuntu/srv/nekro_agent/bin/ffmpeg，再找 PATH 里的 ffmpeg；"
+            "找不到就自动退回 720p 单文件 mp4。"
         ),
     )
 
@@ -604,6 +613,106 @@ def _bilibili_ids(url: str) -> Dict[str, Any]:
     return {"bvid": bvid, "aid": aid, "page": page}
 
 
+def _bilibili_ffmpeg() -> str:
+    """找可用的 ffmpeg：配置值 → 挂载目录 → PATH。找不到就返回空串（自动退回 720p mp4）。"""
+    candidates = [
+        str(getattr(plugin.get_config(), "bilibili_ffmpeg_path", "") or "").strip(),
+        "/home/ubuntu/srv/nekro_agent/bin/ffmpeg",
+        "ffmpeg",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if candidate == "ffmpeg" or Path(candidate).exists():
+            return candidate
+    return ""
+
+
+def _pick_dash_streams(videos: Any, audios: Any) -> tuple[Optional[dict], Optional[dict]]:
+    """挑画质最高、且编码对 QQ 友好的视频流 + 码率最高的音频流。"""
+    codec_order = {7: 0, 12: 1, 13: 2}  # AVC(h264) > HEVC > AV1，QQ 对 h264 兼容最好
+    best_video: Optional[dict] = None
+    best_key: Optional[tuple] = None
+    for item in videos or []:
+        if not item or not item.get("baseUrl"):
+            continue
+        try:
+            quality = int(item.get("id") or 0)
+        except (TypeError, ValueError):
+            quality = 0
+        try:
+            codec = int(item.get("codecid") or 0)
+        except (TypeError, ValueError):
+            codec = 0
+        key = (-quality, codec_order.get(codec, 9))
+        if best_key is None or key < best_key:
+            best_key, best_video = key, item
+    best_audio: Optional[dict] = None
+    for item in audios or []:
+        if not item or not item.get("baseUrl"):
+            continue
+        if best_audio is None or int(item.get("bandwidth") or 0) > int(best_audio.get("bandwidth") or 0):
+            best_audio = item
+    return best_video, best_audio
+
+
+async def _download_bilibili_dash(
+    resolved: Dict[str, Any], task_dir: Path, max_bytes: int
+) -> tuple[Path, str]:
+    """下载 DASH 的视频流 + 音频流，再用 ffmpeg 无损合并成一个 mp4（1080p 及以上必须走这条路）。"""
+    dash = resolved.get("dash") or {}
+    video_url = str(dash.get("video_url") or "")
+    audio_url = str(dash.get("audio_url") or "")
+    if not video_url or not audio_url:
+        raise RuntimeError("B站 DASH 流地址缺失")
+    ffmpeg = _bilibili_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("没有可用的 ffmpeg（无法合并 DASH 音视频）")
+
+    headers = {"User-Agent": _DOWNLOAD_UA, "Referer": "https://www.bilibili.com/", "Accept": "*/*"}
+    video_file = await _download_direct(video_url, task_dir / "video.m4s", max_bytes, headers)
+    audio_file = await _download_direct(audio_url, task_dir / "audio.m4s", max_bytes, headers)
+    total = video_file.stat().st_size + audio_file.stat().st_size
+    if total > max_bytes:
+        raise RuntimeError(
+            f"B站视频合并前总体积 {_human_size(total)} 超过 {_human_size(max_bytes)} 上限，未发送。"
+        )
+
+    output = task_dir / "video.mp4"
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_file),
+        "-i",
+        str(audio_file),
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        raise RuntimeError("ffmpeg 合并超时（视频过大）") from None
+    if process.returncode != 0 or not output.exists() or output.stat().st_size == 0:
+        detail = (stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        raise RuntimeError(f"ffmpeg 合并失败：{detail[-1][:200] if detail else '未知错误'}")
+
+    label = str((resolved.get("videos") or [{}])[0].get("label") or "bilibili")
+    media_id = str(resolved.get("aweme_id") or "bilibili")
+    plugin.logger.info(f"B站 DASH 合并完成：{label} 输出={_human_size(output.stat().st_size)}")
+    return output, f"B站-{label}-{media_id}.mp4"
+
+
 async def _expand_bilibili_url(url: str) -> str:
     """b23.tv 短链 → 跟随跳转拿完整链接。"""
     if "b23.tv" not in _host_of(url):
@@ -615,7 +724,7 @@ async def _expand_bilibili_url(url: str) -> str:
         return str(response.url)
 
 
-async def _resolve_bilibili(url: str) -> Dict[str, Any]:
+async def _resolve_bilibili(url: str, force_mp4: bool = False) -> Dict[str, Any]:
     """取 B 站视频的元信息 + 单文件 mp4 直链（不需要登录、不需要 ffmpeg）。"""
     cookie = str(getattr(plugin.get_config(), "bilibili_cookie", "") or "").strip()
     headers = {"User-Agent": _DOWNLOAD_UA, "Referer": "https://www.bilibili.com/"}
@@ -665,13 +774,16 @@ async def _resolve_bilibili(url: str) -> Dict[str, Any]:
                 "error": "B站接口没有返回 cid（视频可能已删除或仅会员可见）。",
             }
 
+        # 有 ffmpeg 就走 DASH（1080p/4K）；否则退回单文件 mp4（匿名最高 720p）
+        ffmpeg_path = "" if force_mp4 else _bilibili_ffmpeg()
+        fnval = 4048 if ffmpeg_path else 1
         play = await client.get(
             "https://api.bilibili.com/x/player/playurl",
             params={
                 "bvid": data.get("bvid") or ids["bvid"],
                 "cid": cid,
-                "qn": 112,
-                "fnval": 1,
+                "qn": 120,
+                "fnval": fnval,
                 "fourk": 1,
             },
         )
@@ -688,6 +800,69 @@ async def _resolve_bilibili(url: str) -> Dict[str, Any]:
             }
 
         play_data = play_payload.get("data") or {}
+
+        # ---- DASH 分支：视频流 + 音频流分开下，再用 ffmpeg 无损合并 ----
+        # 注意：B 站匿名用户的 DASH 只给到 480p，而单文件 mp4 能到 720p。
+        # 所以只有 DASH 达到 1080p（需要登录 Cookie）时才值得走合并，否则退回 mp4。
+        if fnval != 1:
+            dash = play_data.get("dash") or {}
+            video_stream, audio_stream = _pick_dash_streams(dash.get("video"), dash.get("audio"))
+            if video_stream and audio_stream:
+                try:
+                    quality = int(video_stream.get("id") or 0)
+                except (TypeError, ValueError):
+                    quality = 0
+                label = _BILI_QUALITY_LABELS.get(quality, f"quality-{quality}")
+                if quality >= 80:
+                    total_pages = len(pages)
+                    title = str(data.get("title") or "").strip()
+                    if total_pages > 1:
+                        title = f"{title}（P{page_index + 1}/{total_pages}）"
+                    plugin.logger.info(
+                        f"B站解析：{title[:40]} 清晰度={label}（DASH，待 ffmpeg 合并）"
+                    )
+                    return {
+                        "ok": True,
+                        "platform": "bilibili",
+                        "mode": "dash",
+                        "title": title,
+                        "aweme_id": data.get("bvid") or ids["bvid"] or ids["aid"],
+                        "duration_ms": int(
+                            page_info.get("duration") or data.get("duration") or 0
+                        )
+                        * 1000,
+                        "cover": data.get("pic"),
+                        "dash": {
+                            "video_url": video_stream.get("baseUrl"),
+                            "audio_url": audio_stream.get("baseUrl"),
+                        },
+                        "videos": [
+                            {
+                                "label": label,
+                                "url": video_stream.get("baseUrl"),
+                                "size": None,
+                                "quality": quality,
+                            }
+                        ],
+                    }
+                plugin.logger.info(f"B站 DASH 最高只有 {label}，改走单文件 mp4（匿名可到 720p）")
+            else:
+                plugin.logger.warning("B站没有返回 DASH 流，改走单文件 mp4")
+            fallback = await client.get(
+                "https://api.bilibili.com/x/player/playurl",
+                params={
+                    "bvid": data.get("bvid") or ids["bvid"],
+                    "cid": cid,
+                    "qn": 64,
+                    "fnval": 1,
+                    "fourk": 1,
+                },
+            )
+            if fallback.status_code == 200:
+                fallback_payload = fallback.json()
+                if fallback_payload.get("code") == 0:
+                    play_data = fallback_payload.get("data") or play_data
+
         segments = play_data.get("durl") or []
         if not segments:
             return {
@@ -751,12 +926,27 @@ async def _obtain_video(url: str, task_dir: Path) -> "_MediaSource":
     max_bytes = int(config.max_file_size_mb) * 1024 * 1024
     platform = _platform_of(url)
 
-    # B 站：走公开 API 拿单文件 mp4 直链，云端直接下载（不需要本地解析器，也不需要 ffmpeg）
+    # B 站：走公开 API；有 ffmpeg 时用 DASH 拿 1080p/4K 并合并，否则退回单文件 mp4（匿名 720p）
     if _is_bilibili(url):
+        bili_limit = int(getattr(config, "bilibili_max_size_mb", 300) or 300) * 1024 * 1024
         resolved_bili = await _resolve_bilibili(url)
         if not resolved_bili.get("ok"):
             raise RuntimeError(str(resolved_bili.get("error") or "B站解析失败"))
-        bili_limit = int(getattr(config, "bilibili_max_size_mb", 300) or 300) * 1024 * 1024
+        if resolved_bili.get("mode") == "dash":
+            try:
+                dash_path, dash_name = await _download_bilibili_dash(
+                    resolved_bili, task_dir, bili_limit
+                )
+                return _MediaSource(
+                    name=dash_name, path=dash_path, size=dash_path.stat().st_size
+                )
+            except Exception as error:  # noqa: BLE001 - DASH 失败就退回 720p mp4
+                plugin.logger.warning(f"B站 DASH 合并失败，回退单文件 mp4：{error}")
+                resolved_bili = await _resolve_bilibili(url, force_mp4=True)
+                if not resolved_bili.get("ok"):
+                    raise RuntimeError(
+                        str(resolved_bili.get("error") or "B站解析失败")
+                    ) from error
         picked = _pick_stream(resolved_bili.get("videos") or [], bili_limit)
         if not picked:
             raise RuntimeError("B站没有返回可用的视频直链。")
@@ -1077,7 +1267,7 @@ def create_router() -> APIRouter:
         """Small deployment check; it exposes no configuration or media."""
         return {
             "name": "video_forward",
-            "version": "0.8.0",
+            "version": "0.8.1",
             "supported": ["douyin", "xiaohongshu", "tiktok", "bilibili"],
             "resolver": {
                 "enabled": bool(plugin.get_config().resolver_enabled),
@@ -1213,6 +1403,27 @@ def create_router() -> APIRouter:
             except Exception as error:  # noqa: BLE001 - 自检要把错误原样报出来
                 report["ok"] = False
                 report["error"] = f"图片下载失败：{error}"
+            finally:
+                shutil.rmtree(task_dir, ignore_errors=True)
+            return report
+        if download and resolved.get("ok") and resolved.get("mode") == "dash":
+            # B 站 DASH：真下载两路流并用 ffmpeg 合并，才能证明 1080p 链路可用
+            dash_limit = (
+                int(getattr(plugin.get_config(), "bilibili_max_size_mb", 300) or 300)
+                * 1024
+                * 1024
+            )
+            task_dir = _VIDEO_DIR / f"selftest-dash-{int(time.time())}"
+            task_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                merged_path, _merged_name = await _download_bilibili_dash(
+                    resolved, task_dir, dash_limit
+                )
+                report["downloaded_mb"] = round(merged_path.stat().st_size / 1048576, 2)
+                report["merged"] = True
+            except Exception as error:  # noqa: BLE001 - 自检要把错误原样报出来
+                report["ok"] = False
+                report["error"] = f"DASH 合并失败：{error}"
             finally:
                 shutil.rmtree(task_dir, ignore_errors=True)
             return report

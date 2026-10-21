@@ -29,6 +29,18 @@
 
 - 视频以**合并转发**发出（一条卡片，附原链接）
 - 图文笔记以**一条合并转发**装多张图（`max_images` 控制上限，默认 9 张）
+### B 站的画质说明
+
+| 情况 | 拿到什么 | 走哪条路 |
+|---|---|---|
+| 匿名（`bilibili_cookie` 留空） | **720p** | 单文件 mp4（`fnval=1`），不需要 ffmpeg |
+| 已登录（填了 `SESSDATA`） | **1080p / 4K** | DASH（`fnval=4048`）+ ffmpeg 合并音视频 |
+
+> 有意思的细节：B 站**匿名用户的 DASH 只给 480p**，而单文件 mp4 能到 720p。
+> 所以插件会先看 DASH 能到多高，**只有达到 1080p 才走 DASH 合并**，否则退回 mp4 —— 保证匿名也有 720p。
+
+拿 `SESSDATA`：浏览器登录 bilibili.com → F12 → Application → Storage → Cookies → `https://www.bilibili.com` → 复制 `SESSDATA` 的值（建议用小号，登录态会交给服务器上的插件）。
+
 - B 站：机房 IP 访问网页会被风控（HTTP 412），所以改走 `api.bilibili.com` 的公开接口
   （`view` 拿 cid + `playurl` 的 `fnval=1` 直接返回单文件 mp4），因此 **B 站不需要本地解析器**；
   未登录时 B 站只给到 720p，番剧/课程需要登录 Cookie（会给出明确提示）
@@ -129,6 +141,8 @@ TikTok 这类"由解析器在本机下好文件"的平台，交付方式取决�
 | `send_timeout` | `300` | 合并转发调用的超时（大视频上传慢，别太小） |
 | `max_images` | `9` | 图文笔记最多发送张数（1~20） |
 | `bilibili_max_size_mb` | `300` | B 站视频体积上限（MB），超过不发并提示实际大小 |
+| `bilibili_cookie` | `""` | B 站登录态（填 `SESSDATA`）：留空=匿名 720p；填了才能拿到 1080p/会员视频 |
+| `bilibili_ffmpeg_path` | `""` | 合并 DASH 音视频用的 ffmpeg，留空自动查找挂载目录再找 PATH |
 | `allow_resolver_local_path` | `false` | NapCat 与解析器同机时设为 `true` |
 | `forward_nickname` | `机器人` | 合并转发卡片里显示的昵称（发送者账号取自 `bot.self_id`） |
 

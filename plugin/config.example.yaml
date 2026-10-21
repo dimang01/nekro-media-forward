@@ -32,6 +32,13 @@ max_images: 9
 # B 站视频体积上限（MB）：B 站视频通常更大，单独设一个上限
 bilibili_max_size_mb: 300
 
+# B 站登录态（可选）：填浏览器里 bilibili.com 的 SESSDATA
+# 留空 = 匿名，只能拿 720p；填了才能拿到 1080p / 会员视频（DASH + ffmpeg 合并）
+bilibili_cookie: ""
+
+# 合并 DASH 音视频用的 ffmpeg（留空自动查找）
+bilibili_ffmpeg_path: ""
+
 # NapCat 与解析器同一台机器时设为 true（TikTok 走本机路径直传，零中转）
 # NapCat 在云端时保持 false（改由解析器上传文件）
 allow_resolver_local_path: false
