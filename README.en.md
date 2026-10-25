@@ -5,7 +5,7 @@
 
 中文说明见 [README.md](README.md)。
 
-Auto-detect **Douyin (抖音) / Xiaohongshu (小红书) / TikTok / Bilibili (B站)** links in QQ messages and
+Auto-detect **Douyin (抖音) / Xiaohongshu (小红书) / TikTok / Bilibili (B站) / X (Twitter)** links in QQ messages and
 re-send the media as a QQ **merged forward** (合并转发) card.
 
 - **Zero third-party dependencies** — the plugin is a single Python file; the resolver is a single
@@ -21,6 +21,17 @@ re-send the media as a QQ **merged forward** (合并转发) card.
 - **Bilibili supported** — the public `api.bilibili.com` endpoints are used (`view` for cid,
   `playurl` with `fnval=1` for a single-file mp4), because datacenter IPs get HTTP 412 from the web
   pages. So **Bilibili needs neither the local resolver nor ffmpeg**; without login it caps at 720p.
+- **X (Twitter) supported** — reads the public embed ("syndication") endpoint
+  `cdn.syndication.twimg.com/tweet-result` that X's own embed widget uses: **no login, no API token, no local
+  resolver**. The card carries the post text (author, Beijing time, body, quoted post) followed by the
+  images / video (highest-bitrate mp4 under `x_max_size_mb`; animated GIFs are mp4 too; photos use `?name=orig`).
+  Accepted links: `x.com` / `twitter.com` / `mobile.twitter.com` / `fxtwitter.com` / `vxtwitter.com`
+  `/<user>/status/<id>` and `/i/status/<id>` (with `?s=46`, `/photo/1`, `/video/1`). Config keys:
+  `x_enabled`, `x_max_size_mb`, `x_send_text`, `x_show_stats`.
+  **Limits:** the endpoint is *not* an official API and may change or rate-limit at any time; only public single
+  posts can be read (protected / deleted / login-gated / age-restricted posts fail with a readable message);
+  long posts (note tweets) are truncated; `t.co` short links and media inside a quoted post are not handled.
+  When the endpoint is unavailable the plugin falls back to yt-dlp (video only, no text).
 - **Image posts supported** — Xiaohongshu/Douyin image notes are delivered as one merged card with
   up to `max_images` (default 9) images.
 

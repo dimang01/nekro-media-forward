@@ -105,3 +105,32 @@ TikTok 短链**区分大小写**。`vm.tiktok.com/ZPLSqPDfQ/` 与 `vm.tiktok.com
 
 任何用 `pip install` / `apt install` 临时装进容器的东西，都会在 `docker compose up -d`（重建）后丢失。
 请装到**宿主挂载目录**（容器内同路径可见），并把插件配置指向那里。
+
+---
+
+## 9. X (Twitter) 帖子发不出来 / 提示「无法解析」
+
+X 走的是 **X 嵌入组件的公开数据接口**（`https://cdn.syndication.twimg.com/tweet-result?id=<帖子ID>&token=<任意值>`），
+**不需要登录、不需要 API token、也不需要本地解析器**，和 B 站一样云端直连。所以：
+
+- 只能读**公开的单条帖子**；**受保护账号、已删除、被封禁账号、需登录才能看的敏感 / 年龄限制内容**拿不到，
+  插件会直接提示「没有找到这条 X 帖子：可能已被删除、发帖账号受保护，或需要登录才能查看」之类的中文原因。
+  插件**不会**也不应该去绕过这些限制（不用登录态 / Cookie）。
+- 这个接口**不是 X 官方承诺的 API**：字段、限流、是否继续开放都可能变化。接口返回 429 / 5xx / 网络错误时，
+  插件会重试 3 次，仍失败就**回退 yt-dlp**（只能发视频，没有帖子文字；yt-dlp 对 X 的可用性取决于它的版本和 X 当时的策略，
+  没装或失败时报错里会同时写出两边的原因）。
+- 长文（note tweet）接口只给开头部分，文字节点末尾会注明；被引用帖子里的图片 / 视频不会发，只附正文；
+  `t.co` 短链暂不识别，请发 `x.com/<用户>/status/<ID>` 形式的链接。
+- 视频超过 `x_max_size_mb`（默认 100MB）时不发送，并提示实际大小，可在配置里调大。
+- 不想要文字节点：把 `x_send_text` 设为 `false`（纯文字帖这时会提示没有可发送的内容）。
+- 想完全关掉：`x_enabled: false`，X 链接会被忽略（机器人不会回应）。
+
+**快速自检**（把 `<ID>` 换成帖子 ID，应返回 JSON，里面有 `text` 和 `mediaDetails`）：
+
+```bash
+curl -s -A "Mozilla/5.0" "https://cdn.syndication.twimg.com/tweet-result?id=<ID>&token=a" | head -c 400
+```
+
+返回 404（HTML「Nothing to see here」）= 帖子不存在 / 已删 / 受保护；服务器上这条能通而插件仍失败，再看日志里的
+`X 公开数据接口暂时不可用`、`X 直链下载失败` 等关键字。也可以用 `/resolver/self-test?token=<密钥>&url=<X 帖子链接>&download=true`
+验证「解析 → 下载」。

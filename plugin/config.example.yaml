@@ -39,6 +39,20 @@ bilibili_cookie: ""
 # 合并 DASH 音视频用的 ffmpeg（留空自动查找）
 bilibili_ffmpeg_path: ""
 
+# X (Twitter) 帖子解析：读 X 嵌入组件的公开数据接口，不需要登录 / API token / 本地解析器
+# 只能读公开的单条帖子；受保护、已删除、需登录的帖子会提示无法解析
+x_enabled: true
+
+# X 视频体积上限（MB）：自动挑不超过上限的最高码率 mp4，全部超限则不发并提示实际大小
+x_max_size_mb: 100
+
+# 合并转发里在图片 / 视频前面附上作者、北京时间、正文和被引用帖子正文
+# 关闭后只发图片 / 视频；纯文字帖子在关闭时会提示没有可发送的内容
+x_send_text: true
+
+# 文字里是否带上点赞 / 回复数（仅 x_send_text 为 true 时有效）
+x_show_stats: true
+
 # NapCat 与解析器同一台机器时设为 true（TikTok 走本机路径直传，零中转）
 # NapCat 在云端时保持 false（改由解析器上传文件）
 allow_resolver_local_path: false
