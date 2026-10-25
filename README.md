@@ -6,7 +6,7 @@
 [English](README.en.md) · 中文
 
 
-把 抖音 / 小红书 / TikTok / **B 站** 的公开视频链接，自动解析并以 QQ **合并转发**发回原聊天。
+把 抖音 / 小红书 / TikTok / **B 站** / **X (Twitter)** 的公开视频或图文链接，自动解析并以 QQ **合并转发**发回原聊天。
 为 [NekroAgent](https://github.com/KroMiose/nekro-agent) + OneBot v11 / NapCat 设计，附带一个可选的
 **本地解析器（media-resolver）**，用来处理机房 IP 拿不到的抖音/小红书直链，以及必须走代理的 TikTok；
 B 站不需要解析器 —— 云端直连公开 API 即可（支持 1080p / 4K，见下文）。
@@ -26,6 +26,7 @@ B 站不需要解析器 —— 云端直连公开 API 即可（支持 1080p / 4K
 | 小红书 | ✅ | ✅ | 需登录/风控的笔记会失败，属于平台限制 |
 | TikTok | ✅ | — | 解析器**经代理**下载到本机，再把文件交给 NapCat |
 | B站 | ✅ | — | 走 B 站公开 API 取**单文件 mp4** 直链，云端直接下载（**不需要解析器、不需要 ffmpeg**） |
+| X (Twitter) | ✅（含动图） | ✅ | 读 X 嵌入组件的**公开数据接口**，**不需要登录 / API token / 解析器**；合并转发里附带帖子文字（作者、北京时间、正文、被引用帖子）。纯文字帖也能发 |
 
 
 - 视频以**合并转发**发出（一条卡片，附原链接）
@@ -57,6 +58,14 @@ B 站不需要解析器 —— 云端直连公开 API 即可（支持 1080p / 4K
 | 匿名 | `mode=direct_url`，720p，49.57 MB |
 | 登录后 | `mode=dash`，**1080p**，`merged=true`，71.75 MB |
 
+- X (Twitter)：网页和官方 API 都要登录 / 付费，所以改读 X 嵌入组件自己用的公开接口
+  `https://cdn.syndication.twimg.com/tweet-result?id=<帖子ID>`（返回正文、作者、图片、各档 mp4 直链、引用帖子），
+  因此 **X 不需要本地解析器、不需要登录**。支持 `x.com` / `twitter.com` / `mobile.twitter.com` / `fxtwitter.com` /
+  `vxtwitter.com` 的 `/<用户>/status/<ID>`、`/i/status/<ID>`（可带 `?s=46`、`/photo/1`、`/video/1`）。
+  视频自动挑**不超过 `x_max_size_mb` 的最高码率 mp4**，图片取 `?name=orig` 原图（受 `max_images` 限制）。
+  **限制**：该接口不是 X 官方承诺的 API，字段 / 限流可能随时变化；只能读**公开的单条帖子**，受保护账号、已删除、
+  敏感内容或需登录的帖子无法解析；长文（note tweet）只能拿到开头部分；暂不支持 `t.co` 短链和被引用帖子里的图片 / 视频。
+  接口暂时不可用（限流 / 网络）时会回退 yt-dlp（只能发视频、没有文字）。详见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) 第 9 条。
 - B 站：机房 IP 访问网页会被风控（HTTP 412），所以改走 `api.bilibili.com` 的公开接口
   （`view` 拿 cid + `playurl` 的 `fnval=1` 直接返回单文件 mp4），因此 **B 站不需要本地解析器**；
   未登录时 B 站只给到 720p，番剧/课程需要登录 Cookie（会给出明确提示）
@@ -159,6 +168,10 @@ TikTok 这类"由解析器在本机下好文件"的平台，交付方式取决�
 | `bilibili_max_size_mb` | `300` | B 站视频体积上限（MB），超过不发并提示实际大小 |
 | `bilibili_cookie` | `""` | B 站登录态（填 `SESSDATA`）：留空=匿名 720p；填了才能拿到 1080p/会员视频 |
 | `bilibili_ffmpeg_path` | `""` | 合并 DASH 音视频用的 ffmpeg，留空自动查找挂载目录再找 PATH |
+| `x_enabled` | `true` | 是否解析 X (Twitter) 帖子（公开嵌入接口，无需登录 / 解析器）；关闭后 X 链接被忽略 |
+| `x_max_size_mb` | `100` | X 视频体积上限（MB），自动挑不超过上限的最高码率 mp4，超限则不发并提示实际大小 |
+| `x_send_text` | `true` | 合并转发里在图片 / 视频前附上作者、北京时间、正文和被引用帖子；关闭后只发媒体（纯文字帖会提示无内容） |
+| `x_show_stats` | `true` | 文字里是否带点赞 / 回复数 |
 | `allow_resolver_local_path` | `false` | NapCat 与解析器同机时设为 `true` |
 | `forward_nickname` | `机器人` | 合并转发卡片里显示的昵称（发送者账号取自 `bot.self_id`） |
 

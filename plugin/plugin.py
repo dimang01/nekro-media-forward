@@ -14,11 +14,16 @@
    链接交给本机 NapCat 以合并转发发出。
 
 小红书继续走 yt-dlp。
+
+X (Twitter) 和 B 站一样不需要本地解析器：读 X 嵌入组件用的公开 syndication 接口，
+无需登录、无需 API token，拿到正文 / 图片 / 视频直链后云端直接下载并以合并转发发出。
 """
 
 from __future__ import annotations
 
 import asyncio
+import html
+import math
 import mimetypes
 import os
 import re
@@ -28,6 +33,7 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode, urlparse
@@ -47,8 +53,8 @@ from nekro_agent.api.signal import MsgSignal
 plugin = NekroPlugin(
     name="短视频合并转发",
     module_name="video_forward",
-    description="收到公开的抖音 / 小红书 / TikTok / B站 视频链接后，将视频以 QQ 合并转发发回原聊天。抖音与小红书由本地解析器取直链，B站走公开 API。",
-    version="0.9.0",
+    description="收到公开的抖音 / 小红书 / TikTok / B站 / X 链接后，将视频或图文以 QQ 合并转发发回原聊天。抖音与小红书由本地解析器取直链，B站走公开 API，X 读公开嵌入数据接口（含帖子文字）。",
+    version="0.10.0",
     author="local_video",
     url="https://github.com/KroMiose/nekro-agent",
     support_adapter=["onebot_v11"],
@@ -176,6 +182,37 @@ class VideoForwardConfig(ConfigBase):
             "注意：这相当于把账号登录态交给服务器上的插件，请自行评估风险，别用主账号。"
         ),
     )
+    x_enabled: bool = Field(
+        default=True,
+        title="启用 X (Twitter) 帖子解析",
+        description=(
+            "收到 x.com / twitter.com（含 fxtwitter / vxtwitter）的帖子链接时，解析正文、图片和视频并合并转发。"
+            "走 X 嵌入组件的公开数据接口，不需要登录或 API token，也不需要本地解析器；"
+            "只能读公开的单条帖子，受保护 / 已删除 / 需登录的帖子会提示无法解析。关闭后 X 链接会被忽略。"
+        ),
+    )
+    x_max_size_mb: int = Field(
+        default=100,
+        ge=5,
+        le=500,
+        title="X 视频体积上限（MB）",
+        description=(
+            "X 视频会挑不超过此上限的最高码率 mp4；全部档位都超过时不发送，并提示实际大小。默认 100MB。"
+        ),
+    )
+    x_send_text: bool = Field(
+        default=True,
+        title="X 帖子同时发送文字",
+        description=(
+            "合并转发里在图片 / 视频前面附上作者、北京时间、帖子正文和被引用帖子的正文；"
+            "纯文字帖子也只会发这段文字。关闭后只发图片 / 视频，纯文字帖子会提示没有可发送的内容。"
+        ),
+    )
+    x_show_stats: bool = Field(
+        default=True,
+        title="X 帖子文字里显示点赞 / 回复数",
+        description="只在「X 帖子同时发送文字」打开时有效。",
+    )
     bilibili_ffmpeg_path: str = Field(
         default="",
         title="B站 ffmpeg 路径（可选）",
@@ -208,18 +245,33 @@ _RESOLVER_DOMAINS = (
     "xhslink.cn",
     "tiktok.com",
 )
+# X (Twitter) 及其常见镜像域名：走公开 syndication 接口，不需要本地解析器
+_X_DOMAINS = (
+    "x.com",
+    "twitter.com",
+    "fxtwitter.com",
+    "vxtwitter.com",
+    "fixupx.com",
+    "fixvx.com",
+)
 _DOWNLOAD_REFERER = {
     "douyin": "https://www.douyin.com/",
     "xiaohongshu": "https://www.xiaohongshu.com/",
     "tiktok": "https://www.tiktok.com/",
     "bilibili": "https://www.bilibili.com/",
+    "x": "https://x.com/",
 }
 # QQ 分享文案有时会把短链和标题拆成不同消息段，甚至省去 https://。
 # 因此只找受支持站点，而不是依赖整段消息恰好是一个标准 URL。
 _URL_RE = re.compile(
     r"(?:(?:https?://)?(?:[a-z0-9-]+\.)*(?:douyin\.com|iesdouyin\.com|"
     r"xiaohongshu\.com|xhslink\.(?:com|cn)|tiktok\.com|bilibili\.com|b23\.tv)"
-    r"(?:/[^\s<>'\"，。！？、]*)?)",
+    r"(?:/[^\s<>'\"，。！？、]*)?"
+    # X：只认带 /status/<id> 的帖子链接（x.com 首页、个人主页不处理）；
+    # 前面不能紧挨字母数字，否则 box.com 之类会被当成 x.com
+    r"|(?<![A-Za-z0-9_.@/-])(?:https?://)?(?:[a-z0-9-]+\.)*"
+    r"(?:x|twitter|fxtwitter|vxtwitter|fixupx|fixvx)\.com/"
+    r"(?:i/(?:web/)?|[A-Za-z0-9_]{1,50}/)status(?:es)?/\d+[^\s<>'\"，。！？、]*)",
     re.IGNORECASE,
 )
 _VIDEO_DIR = Path("/tmp/nekro-video-forward")
@@ -233,7 +285,7 @@ _DOWNLOAD_UA = (
 )
 
 
-_PLATFORM_NAMES = {"douyin": "抖音", "xiaohongshu": "小红书", "tiktok": "TikTok", "bilibili": "B站"}
+_PLATFORM_NAMES = {"douyin": "抖音", "xiaohongshu": "小红书", "tiktok": "TikTok", "bilibili": "B站", "x": "X"}
 
 
 @dataclass
@@ -252,6 +304,8 @@ class _MediaSource:
     # 图文笔记（小红书/抖音图集）：图片直链，由插件逐张下载后合成一条合并转发。
     # 非空时 path / local_path 均为空。
     images: tuple = ()
+    # 放在媒体前面的文字节点（X 帖子正文等）；为空则用默认的「平台 + 视频/图文 + 链接」。
+    caption: str = ""
 
 
 @dataclass
@@ -365,6 +419,10 @@ def _find_supported_url(text: str) -> Optional[str]:
         if not url.lower().startswith(("http://", "https://")):
             url = "https://" + url
         host = (urlparse(url).hostname or "").lower().strip(".")
+        if _is_x(url):
+            if _x_status_id(url) and _x_enabled():
+                return url
+            continue
         if any(host == domain or host.endswith("." + domain) for domain in _SUPPORTED_DOMAINS):
             return url
     return None
@@ -399,6 +457,11 @@ def _platform_of(url: str) -> Optional[str]:
     return None
 
 
+def _download_platform(url: str) -> Optional[str]:
+    """下载图片 / 视频时用来挑 Referer 的平台键：本地解析器平台 + X（X 不走解析器，所以 _platform_of 里没有它）。"""
+    return "x" if _is_x(url) else _platform_of(url)
+
+
 def _needs_local_resolver(url: str) -> bool:
     return _platform_of(url) is not None
 
@@ -413,6 +476,8 @@ def _source_name(url: str) -> str:
         return "TikTok"
     if "bilibili" in host or "b23.tv" in host:
         return "B站"
+    if _is_x(url):
+        return "X"
     return "未知平台"
 
 
@@ -524,7 +589,7 @@ async def _download_direct(url: str, target: Path, max_bytes: int, headers: Dict
 
 
 async def _run_ytdlp(url: str, task_dir: Path) -> tuple[Path, str]:
-    """用 yt-dlp 下载（小红书 / X 走这条路）。"""
+    """用 yt-dlp 下载（小红书兜底；X 的公开接口不可用时也回退到这里）。"""
     binary = (plugin.get_config().yt_dlp_path or "yt-dlp").strip()
     if not binary or ("/" not in binary and "\\" not in binary and not shutil.which(binary)):
         raise RuntimeError("服务器尚未安装 yt-dlp，管理员需要先安装后才能解析视频。")
@@ -970,13 +1035,466 @@ async def _resolve_bilibili(url: str, force_mp4: bool = False) -> Dict[str, Any]
         }
 
 
+# ---------------------------------------------------------------- X (Twitter)
+# X 的网页和官方 API 都要登录 / 付费，但「嵌入帖子」用的公开接口不需要：
+#   https://cdn.syndication.twimg.com/tweet-result?id=<帖子ID>&token=<任意值>
+# 返回单条公开帖子的 JSON（正文 / 作者 / 图片 / 视频各档 mp4 直链 / 引用帖子等），
+# 所以 X 和 B 站一样不需要本地解析器，云端直连即可。
+# 注意：这是 X 嵌入组件自用的接口，**并非官方承诺的 API**，字段和限流策略可能随时变化；
+# 受保护账号、已删除、年龄/敏感内容限制的帖子拿不到（拿不到时回退 yt-dlp，仍失败就报错）。
+
+_X_STATUS_RE = re.compile(r"/status(?:es)?/(\d{1,25})(?![0-9])", re.IGNORECASE)
+_X_SYNDICATION_URL = "https://cdn.syndication.twimg.com/tweet-result"
+_X_MAX_TEXT_CHARS = 1500
+_BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def _is_x(url: str) -> bool:
+    """是否 X / Twitter 链接（含 fxtwitter / vxtwitter 这类镜像域名）。"""
+    value = str(url or "").strip()
+    if "://" not in value:
+        value = "https://" + value
+    host = _host_of(value).strip(".")
+    return any(host == domain or host.endswith("." + domain) for domain in _X_DOMAINS)
+
+
+def _x_status_id(url: str) -> Optional[str]:
+    """从 X 链接里取出帖子 ID；支持 /<user>/status/<id>、/i/status/<id>、/i/web/status/<id>、
+    以及 .../photo/1、.../video/1 和 ?s=46 这类尾巴。认不出来返回 None。"""
+    value = str(url or "").strip()
+    if not value:
+        return None
+    if "://" not in value:
+        value = "https://" + value
+    if not _is_x(value):
+        return None
+    match = _X_STATUS_RE.search(urlparse(value).path or "")
+    return match.group(1) if match else None
+
+
+def _x_enabled() -> bool:
+    try:
+        return bool(getattr(plugin.get_config(), "x_enabled", True))
+    except Exception:  # noqa: BLE001 - 读不到配置时按默认启用
+        return True
+
+
+def _x_token(tweet_id: str) -> str:
+    """syndication 的 token：与 X 嵌入组件相同的算法 ``(id / 1e15 * π)`` 转 36 进制并去掉 0 和小数点。
+    实测接口并不校验它（任意值如 ``a`` 也行），这里仍按原算法生成，更接近浏览器行为。"""
+    try:
+        value = (int(tweet_id) / 1e15) * math.pi
+    except (TypeError, ValueError):
+        return "a"
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    integer = int(value)
+    fraction = value - integer
+    out = ""
+    while integer > 0:
+        integer, rest = divmod(integer, 36)
+        out = digits[rest] + out
+    out = out or "0"
+    tail = ""
+    for _ in range(12):
+        if fraction <= 0:
+            break
+        fraction *= 36
+        digit = int(fraction)
+        tail += digits[digit]
+        fraction -= digit
+    token = (out + tail).replace("0", "")
+    return token or "a"
+
+
+def _x_clean_text(data: Dict[str, Any]) -> str:
+    """整理帖子正文：去掉媒体占位的 t.co 链接，把普通短链换成真实地址，还原 HTML 转义。"""
+    text = str(data.get("text") or "")
+    entities = data.get("entities") or {}
+    for media in entities.get("media") or []:
+        if isinstance(media, dict) and media.get("url"):
+            text = text.replace(str(media["url"]), "")
+    quoted_id = str(((data.get("quoted_tweet") or {}).get("id_str")) or "")
+    for item in entities.get("urls") or []:
+        if not isinstance(item, dict) or not item.get("url"):
+            continue
+        expanded = str(item.get("expanded_url") or item["url"])
+        # 引用帖子时，正文末尾那条指向被引用帖子的链接没有信息量，去掉
+        replacement = "" if quoted_id and quoted_id in expanded else expanded
+        text = text.replace(str(item["url"]), replacement)
+    return html.unescape(text).strip()
+
+
+def _x_beijing_time(created_at: Any) -> str:
+    """ISO 时间（UTC）→ 北京时间 ``YYYY-MM-DD HH:MM``；解析不了就返回空串。"""
+    try:
+        moment = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return ""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(_BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def _x_tombstone_message(data: Dict[str, Any]) -> str:
+    """帖子墓碑（TweetTombstone）→ 可读的中文原因。"""
+    tombstone = data.get("tombstone") or {}
+    raw = ""
+    for key in ("text", "title"):
+        part = tombstone.get(key)
+        raw = str((part.get("text") if isinstance(part, dict) else part) or "") or raw
+    lowered = raw.lower()
+    if "suspended" in lowered:
+        reason = "发帖账号已被封禁"
+    elif "protected" in lowered or "limits who can view" in lowered or "approved followers" in lowered:
+        reason = "账号开启了帖子保护，只有关注者能看"
+    elif "sensitive" in lowered or "age-restricted" in lowered or "log in" in lowered or "sign in" in lowered:
+        reason = "涉及敏感内容或年龄限制，需要登录才能查看"
+    elif "deleted" in lowered or "removed" in lowered or "unavailable" in lowered:
+        reason = "帖子已被删除或不可用"
+    else:
+        reason = "帖子不可见"
+    return f"无法解析这条 X 帖子：{reason}。" + (f"（X 提示：{raw[:120]}）" if raw else "")
+
+
+def _x_video_variants(media: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """从 mediaDetails 的 video_info.variants 里挑出 mp4（HLS m3u8 不要），按码率从高到低排序。"""
+    info = media.get("video_info") or {}
+    duration_ms = int(info.get("duration_millis") or 0)
+    is_gif = media.get("type") == "animated_gif"
+    out: List[Dict[str, Any]] = []
+    for variant in info.get("variants") or []:
+        if not isinstance(variant, dict) or not variant.get("url"):
+            continue
+        if "mp4" not in str(variant.get("content_type") or ""):
+            continue
+        link = str(variant["url"])
+        size_match = re.search(r"/(\d{2,5})x(\d{2,5})/", link)
+        width = int(size_match.group(1)) if size_match else 0
+        height = int(size_match.group(2)) if size_match else 0
+        bitrate = int(variant.get("bitrate") or 0)
+        label = "动图" if is_gif else (f"{height}p" if height else (f"{bitrate // 1000}k" if bitrate else "mp4"))
+        item: Dict[str, Any] = {
+            "label": label,
+            "url": link,
+            "size": None,
+            "width": width or None,
+            "height": height or None,
+            "bitrate": bitrate or None,
+        }
+        if bitrate and duration_ms:
+            item["estimated_size"] = int(bitrate * duration_ms / 8000)
+        out.append(item)
+    out.sort(key=lambda item: int(item.get("bitrate") or 0), reverse=True)
+    return out
+
+
+async def _x_fill_sizes(videos: List[Dict[str, Any]]) -> None:
+    """用 HEAD 请求补上每档 mp4 的真实体积（供 _pick_stream 按上限挑选）；
+    拿不到就退回「码率 × 时长」的估算值，估算值只作兜底。"""
+    if not videos:
+        return
+    headers = {"User-Agent": _DOWNLOAD_UA, "Referer": _DOWNLOAD_REFERER["x"], "Accept": "*/*"}
+
+    async def head(client: httpx.AsyncClient, item: Dict[str, Any]) -> None:
+        try:
+            response = await client.head(str(item["url"]))
+            length = int(response.headers.get("content-length") or 0)
+            if response.status_code < 400 and length > 0:
+                item["size"] = length
+                return
+        except Exception as error:  # noqa: BLE001 - HEAD 失败不影响解析，退回估算
+            plugin.logger.info(f"X 视频体积探测失败（使用估算值）：{error}")
+        if item.get("estimated_size"):
+            item["size"] = item["estimated_size"]
+            item["size_estimated"] = True
+
+    async with httpx.AsyncClient(headers=headers, timeout=15, follow_redirects=True) as client:
+        await asyncio.gather(*(head(client, item) for item in videos))
+
+
+async def _fetch_x_syndication(tweet_id: str) -> Dict[str, Any]:
+    """请求 syndication 接口，少量重试。返回 ``{"kind": ..., ...}``：
+    ``data`` 正常 / ``missing`` 404 / ``blocked`` 401、403 / ``retry`` 暂时性失败（限流、网络、非 JSON）。"""
+    headers = {
+        "User-Agent": _DOWNLOAD_UA,
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://platform.twitter.com/",
+    }
+    params = {"id": tweet_id, "token": _x_token(tweet_id)}
+    last_error = "未知错误"
+    for attempt in range(3):
+        if attempt:
+            await asyncio.sleep(1.5 * attempt)
+        try:
+            async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(15.0), follow_redirects=True) as client:
+                response = await client.get(_X_SYNDICATION_URL, params=params)
+        except httpx.HTTPError as error:
+            last_error = f"网络错误 {type(error).__name__}"
+            continue
+        status = response.status_code
+        if status == 404:
+            return {"kind": "missing"}
+        if status in (401, 403):
+            return {"kind": "blocked", "status": status}
+        if status == 429 or status >= 500:
+            last_error = f"HTTP {status}"
+            continue
+        if status != 200:
+            last_error = f"HTTP {status}"
+            break
+        try:
+            payload = response.json()
+        except ValueError:
+            last_error = "返回的不是 JSON"
+            continue
+        if not isinstance(payload, dict):
+            last_error = "返回内容格式异常"
+            continue
+        return {"kind": "data", "data": payload}
+    return {"kind": "retry", "error": last_error}
+
+
+async def _resolve_x(url: str) -> Dict[str, Any]:
+    """取 X 帖子的正文 + 图片 + 视频直链（公开嵌入接口，不需要登录、不需要 API token）。
+
+    返回 ``ok=False`` 且带 ``fallback=True`` 表示接口暂时不可用（限流 / 网络 / 返回异常），
+    调用方可以回退 yt-dlp；没有 ``fallback`` 的失败（已删除 / 受保护 / 需要登录）是确定的，不必再试。
+    """
+    tweet_id = _x_status_id(url)
+    if not tweet_id:
+        return {"ok": False, "platform": "x", "error": f"没能从链接里认出 X 帖子 ID（链接：{str(url)[:100]}）。"}
+
+    fetched = await _fetch_x_syndication(tweet_id)
+    kind = fetched.get("kind")
+    if kind == "missing":
+        return {
+            "ok": False,
+            "platform": "x",
+            "error": "没有找到这条 X 帖子：可能已被删除、发帖账号受保护，或需要登录才能查看。",
+        }
+    if kind == "blocked":
+        return {
+            "ok": False,
+            "platform": "x",
+            "error": f"X 拒绝了公开访问（HTTP {fetched.get('status')}），这条帖子可能需要登录才能查看。",
+        }
+    if kind != "data":
+        return {
+            "ok": False,
+            "platform": "x",
+            "fallback": True,
+            "error": f"X 公开数据接口暂时不可用（{fetched.get('error')}）。",
+        }
+
+    data: Dict[str, Any] = fetched["data"]
+    typename = str(data.get("__typename") or "")
+    if typename == "TweetTombstone" or (data.get("tombstone") and not data.get("text")):
+        return {"ok": False, "platform": "x", "error": _x_tombstone_message(data)}
+    if not data.get("id_str") and not data.get("text") and not data.get("mediaDetails"):
+        # 受保护 / 已删除的帖子偶尔会返回空对象
+        return {
+            "ok": False,
+            "platform": "x",
+            "error": "X 没有返回这条帖子的内容：可能已被删除、账号受保护或需要登录才能查看。",
+        }
+
+    user = data.get("user") or {}
+    details = [item for item in (data.get("mediaDetails") or []) if isinstance(item, dict)]
+    unavailable = [
+        item
+        for item in details
+        if str((item.get("ext_media_availability") or {}).get("status") or "Available").lower() != "available"
+    ]
+
+    image_list: List[str] = []
+    videos: List[Dict[str, Any]] = []
+    cover: Optional[str] = None
+    duration_ms = 0
+    has_video_media = False
+    for media in details:
+        media_type = media.get("type")
+        link = str(media.get("media_url_https") or "")
+        if media_type == "photo" and link:
+            # ?name=orig 取原图（接口默认给的是压缩过的 large）
+            image_list.append(link + ("&" if "?" in link else "?") + "name=orig")
+            cover = cover or link
+        elif media_type in ("video", "animated_gif"):
+            if has_video_media:
+                continue  # 一条帖子只会有一个视频 / 动图，其余忽略
+            has_video_media = True
+            videos = _x_video_variants(media)
+            duration_ms = int((media.get("video_info") or {}).get("duration_millis") or 0)
+            if link:
+                cover = link
+    if not image_list and not has_video_media:
+        # 个别返回只有顶层 photos 字段
+        for photo in data.get("photos") or []:
+            if isinstance(photo, dict) and photo.get("url"):
+                image_list.append(str(photo["url"]) + "?name=orig")
+        cover = cover or (image_list[0] if image_list else None)
+
+    if has_video_media and not videos and not image_list and not str(data.get("text") or "").strip():
+        return {"ok": False, "platform": "x", "error": "这条 X 视频没有可用的 mp4 直链（可能只有 HLS 流）。"}
+    if unavailable and not videos and not image_list and not str(data.get("text") or "").strip():
+        return {
+            "ok": False,
+            "platform": "x",
+            "error": "这条 X 帖子的媒体不可用（可能涉及敏感内容、版权限制，或需要登录才能查看）。",
+        }
+
+    await _x_fill_sizes(videos)
+
+    quoted_raw = data.get("quoted_tweet") if isinstance(data.get("quoted_tweet"), dict) else None
+    quoted: Optional[Dict[str, Any]] = None
+    if quoted_raw:
+        quoted_user = quoted_raw.get("user") or {}
+        quoted = {
+            "id": str(quoted_raw.get("id_str") or ""),
+            "author": str(quoted_user.get("name") or ""),
+            "screen_name": str(quoted_user.get("screen_name") or ""),
+            "text": _x_clean_text(quoted_raw),
+        }
+
+    screen_name = str(user.get("screen_name") or "")
+    canonical = (
+        f"https://x.com/{screen_name}/status/{tweet_id}" if screen_name else f"https://x.com/i/status/{tweet_id}"
+    )
+    return {
+        "ok": True,
+        "platform": "x",
+        "mode": "direct_url",
+        "note_id": str(data.get("id_str") or tweet_id),
+        "title": _x_clean_text(data),
+        "author": str(user.get("name") or ""),
+        "screen_name": screen_name,
+        "created_at": data.get("created_at"),
+        "created_at_beijing": _x_beijing_time(data.get("created_at")),
+        "likes": data.get("favorite_count"),
+        "replies": data.get("conversation_count"),
+        "lang": data.get("lang"),
+        "possibly_sensitive": bool(data.get("possibly_sensitive")),
+        "long_text": bool(data.get("note_tweet")),
+        "canonical_url": canonical,
+        "duration_ms": duration_ms,
+        "cover": cover,
+        "videos": videos,
+        "image_list": image_list,
+        "is_gif": any(item.get("type") == "animated_gif" for item in details),
+        "quoted": quoted,
+    }
+
+
+def _format_x_caption(resolved: Dict[str, Any], kind: str, with_stats: bool) -> str:
+    """把解析结果排成合并转发里放在媒体前面的文字：作者 / 北京时间 / 正文 / 引用 / 原链接。"""
+    author = str(resolved.get("author") or "").strip()
+    screen_name = str(resolved.get("screen_name") or "").strip()
+    who = f"{author} @{screen_name}" if author and screen_name else (f"@{screen_name}" if screen_name else author)
+    when = str(resolved.get("created_at_beijing") or "")
+    meta = [part for part in (who, f"{when}（北京时间）" if when else "") if part]
+    lines = [f"X 帖子 · {kind}"]
+    if meta:
+        lines.append(" · ".join(meta))
+    if with_stats and (resolved.get("likes") is not None or resolved.get("replies") is not None):
+        stats = []
+        if resolved.get("likes") is not None:
+            stats.append(f"点赞 {resolved['likes']}")
+        if resolved.get("replies") is not None:
+            stats.append(f"回复 {resolved['replies']}")
+        lines.append(" · ".join(stats))
+    body = str(resolved.get("title") or "").strip()
+    if body:
+        if len(body) > _X_MAX_TEXT_CHARS:
+            body = body[:_X_MAX_TEXT_CHARS] + "…"
+        lines.append("")
+        lines.append(body)
+        if resolved.get("long_text"):
+            lines.append("（长文，接口只返回了开头部分，完整内容请看原帖）")
+    quoted = resolved.get("quoted") or None
+    if quoted and (quoted.get("text") or quoted.get("author")):
+        quoted_who = f"@{quoted['screen_name']}" if quoted.get("screen_name") else (quoted.get("author") or "")
+        quoted_text = str(quoted.get("text") or "").strip()
+        if len(quoted_text) > _X_MAX_TEXT_CHARS:
+            quoted_text = quoted_text[:_X_MAX_TEXT_CHARS] + "…"
+        lines.append("")
+        lines.append(f"↪ 引用 {quoted_who}：{quoted_text}" if quoted_text else f"↪ 引用 {quoted_who}")
+    lines.append("")
+    lines.append(f"链接：{resolved.get('canonical_url') or ''}")
+    return "\n".join(lines)
+
+
+async def _obtain_x(url: str, task_dir: Path) -> "_MediaSource":
+    """X 帖子 → 可发送的内容：视频 / 动图下 mp4，图片按图组，纯文字只有文字节点。
+
+    解析靠公开嵌入接口；接口暂时不可用时回退 yt-dlp（只能拿到视频，没有正文）。
+    """
+    config = plugin.get_config()
+    x_limit = int(getattr(config, "x_max_size_mb", 100) or 100) * 1024 * 1024
+    send_text = bool(getattr(config, "x_send_text", True))
+    show_stats = bool(getattr(config, "x_show_stats", True))
+
+    try:
+        resolved = await _resolve_x(url)
+    except Exception as error:  # noqa: BLE001 - 网络层之外的意外错误也走回退
+        plugin.logger.warning(f"X 解析异常：{error}")
+        resolved = {"ok": False, "platform": "x", "fallback": True, "error": f"X 解析失败：{error}"}
+
+    if not resolved.get("ok"):
+        message = str(resolved.get("error") or "X 解析失败")
+        if not resolved.get("fallback"):
+            raise RuntimeError(message)
+        plugin.logger.warning(f"{message} 回退 yt-dlp")
+        try:
+            video, name = await _run_ytdlp(url, task_dir)
+        except Exception as error:  # noqa: BLE001 - 把两边的原因一起报给用户
+            raise RuntimeError(f"{message}yt-dlp 回退也失败：{error}") from error
+        return _MediaSource(name=name, path=video, size=video.stat().st_size)
+
+    note_id = resolved.get("note_id") or _x_status_id(url) or int(time.time())
+    videos = resolved.get("videos") or []
+    images = [str(item) for item in (resolved.get("image_list") or []) if item]
+    limit = max(1, int(getattr(config, "max_images", 9) or 9))
+    picked_images = images[:limit]
+
+    if videos:
+        kind = "动图" if resolved.get("is_gif") else "视频"
+    elif images:
+        kind = f"图文（{len(picked_images)} 张）"
+    else:
+        kind = "纯文字"
+    caption = _format_x_caption(resolved, kind, show_stats) if send_text else ""
+    if caption and len(images) > len(picked_images):
+        caption += f"\n（共 {len(images)} 张图片，仅发送前 {len(picked_images)} 张）"
+
+    if not videos and not images and not send_text:
+        raise RuntimeError("这条 X 帖子只有文字，而配置里已关闭「X 发送帖子文字」，没有可发送的内容。")
+
+    source = _MediaSource(name=f"X-{note_id}", caption=caption)
+    if images:
+        source.images = tuple(picked_images)
+        plugin.logger.info(f"X 图片：共 {len(images)} 张，本次发送 {len(picked_images)} 张")
+    if videos:
+        picked = _pick_stream(videos, x_limit)
+        if picked and picked.get("size") and int(picked["size"]) > x_limit:
+            raise RuntimeError(
+                f"X 视频最小也有 {_human_size(picked['size'])}，超过 {_human_size(x_limit)} 上限，未发送。"
+                "可在插件配置里调大「X 视频体积上限」。"
+            )
+        downloaded = await _download_resolved(resolved, "x", task_dir, x_limit)
+        source.name = downloaded.name
+        source.path = downloaded.path
+        source.size = downloaded.size
+    return source
+
+
+
 async def _obtain_video(url: str, task_dir: Path) -> "_MediaSource":
     """拿到可发送的视频。
 
     - 抖音 / 小红书：本地解析器取直链 → 服务器流式下载 → 走临时链接
     - TikTok：大陆直连被墙、云端完全不可达，所以由**本机**解析器走代理下好文件，
       这里只拿到一个本机路径，直接交给同机的 NapCat 上传（不经过服务器）
-    - 其它平台（X 等）：yt-dlp 下载
+    - X：公开 syndication 接口取正文 / 图片 / 视频直链（见 _obtain_x，接口不可用时回退 yt-dlp）
+    - 其它平台：yt-dlp 下载
 
     只有在**解析**这一步不可用（解析器离线 / 超时 / 解析失败）时，小红书才回退 yt-dlp；
     直链下载失败会直接报错，不去做无意义的回退。抖音、TikTok 没有回退路径。
@@ -984,6 +1502,10 @@ async def _obtain_video(url: str, task_dir: Path) -> "_MediaSource":
     config = plugin.get_config()
     max_bytes = int(config.max_file_size_mb) * 1024 * 1024
     platform = _platform_of(url)
+
+    # X：公开嵌入接口，不需要本地解析器
+    if _is_x(url):
+        return await _obtain_x(url, task_dir)
 
     # B 站：走公开 API；有 ffmpeg 时用 DASH 拿 1080p/4K 并合并，否则退回单文件 mp4（匿名 720p）
     if _is_bilibili(url):
@@ -1156,17 +1678,26 @@ async def _send_forward(
     name: str,
     source_url: str,
     images: Optional[list] = None,
+    caption: str = "",
 ) -> None:
     """把视频或图文以合并转发发出。
 
     ``file_ref`` 既可以是服务器上的临时链接（http URL），
     也可以是 NapCat 所在机器上的本地文件路径（TikTok 用这种）。
     ``images`` 非空时改为发图片组（图文笔记），每个节点放一张图。
+    ``caption`` 非空时作为最前面的文字节点（X 帖子正文等），替代默认的「平台 + 链接」抬头；
+    图片和视频都有时（混合帖子）先发图片再发视频；两者都没有就只发文字（纯文字帖子）。
     """
     kind, target = _target(ctx)
     source = _source_name(source_url)
-    if images:
-        content: list = [{
+    if caption:
+        content: list = [{"type": "text", "data": {"text": caption}}]
+        for reference in images or []:
+            content.append({"type": "image", "data": {"file": reference}})
+        if file_ref:
+            content.append({"type": "video", "data": {"file": file_ref, "name": name}})
+    elif images:
+        content = [{
             "type": "text",
             "data": {"text": f"{source} 图文（{len(images)} 张）\n链接：{source_url}"},
         }]
@@ -1225,7 +1756,7 @@ async def _process(ctx: AgentCtx, url: str) -> str:
         if source.images:
             # 图文笔记：逐张下载到服务器，再用临时链接合成一条合并转发
             referer = _DOWNLOAD_REFERER.get(
-                _platform_of(url) or "xiaohongshu", "https://www.xiaohongshu.com/"
+                _download_platform(url) or "xiaohongshu", "https://www.xiaohongshu.com/"
             )
             headers = {"User-Agent": _DOWNLOAD_UA, "Referer": referer, "Accept": "*/*"}
             max_bytes = int(plugin.get_config().max_file_size_mb) * 1024 * 1024
@@ -1236,9 +1767,21 @@ async def _process(ctx: AgentCtx, url: str) -> str:
                 )
                 refs.append(_lease_url(image_path, f"{source.name}-{index:02d}.jpg"))
             plugin.logger.info(f"{_source_name(url)}图文发送：{len(refs)} 张（{source.name}）")
-            await _send_forward(ctx, None, source.name, url, images=refs)
+            # 混合帖子（图片 + 视频 / 动图）：视频也交给同一条合并转发
+            video_ref = _lease_url(source.path, source.name) if source.path else None
+            await _send_forward(
+                ctx, video_ref, source.name, url, images=refs, caption=source.caption
+            )
             _RECENT_URLS[key] = time.time() + 30 * 60
+            if video_ref:
+                return f"图文和视频已通过合并转发发回原聊天（{len(refs)} 张图片）。"
             return f"图文已通过合并转发发回原聊天（{len(refs)} 张图片）。"
+        if source.caption and not source.path and not source.local_path:
+            # 纯文字帖子（X）：只有文字节点
+            await _send_forward(ctx, None, source.name, url, caption=source.caption)
+            _RECENT_URLS[key] = time.time() + 30 * 60
+            shutil.rmtree(task_dir, ignore_errors=True)
+            return "帖子文字已通过合并转发发回原聊天。"
         if source.local_path:
             # 文件就在 NapCat 那台机器上（TikTok），直接把路径交给它上传，服务器不中转
             file_ref = source.local_path
@@ -1248,7 +1791,7 @@ async def _process(ctx: AgentCtx, url: str) -> str:
             if source.path is None:
                 raise RuntimeError("没有拿到可发送的视频文件")
             file_ref = _lease_url(source.path, source.name)
-        await _send_forward(ctx, file_ref, source.name, url)
+        await _send_forward(ctx, file_ref, source.name, url, caption=source.caption)
         _RECENT_URLS[key] = time.time() + 30 * 60
         return "视频已通过合并转发发回原聊天。"
     except Exception as error:
@@ -1275,13 +1818,13 @@ async def auto_forward_video(ctx: AgentCtx, message: ChatMessage) -> MsgSignal |
 @plugin.mount_sandbox_method(
     SandboxMethodType.BEHAVIOR,
     name="解析并合并转发短视频",
-    description="下载公开的抖音、小红书、TikTok 视频链接，并以 QQ 合并转发发送到当前聊天。不支持 B 站、付费、私密或受保护视频。",
+    description="下载公开的抖音、小红书、TikTok、B站视频和 X (Twitter) 帖子（文字 + 图片 / 视频）链接，并以 QQ 合并转发发送到当前聊天。不支持付费、私密或受保护内容。",
 )
 async def forward_video(ctx: AgentCtx, url: str) -> str:
-    """当用户明确要求解析短视频时调用；参数必须是公开的抖音、小红书、TikTok 或 B站 链接。"""
+    """当用户明确要求解析短视频时调用；参数必须是公开的抖音、小红书、TikTok、B站 或 X 帖子链接。"""
     candidate = _find_supported_url(url)
     if not candidate:
-        return "只支持公开的抖音、小红书、TikTok 和 B站 视频链接。"
+        return "只支持公开的抖音、小红书、TikTok、B站 视频和 X 帖子链接。"
     return await _process(ctx, candidate)
 
 
@@ -1326,8 +1869,8 @@ def create_router() -> APIRouter:
         """Small deployment check; it exposes no configuration or media."""
         return {
             "name": "video_forward",
-            "version": "0.9.0",
-            "supported": ["douyin", "xiaohongshu", "tiktok", "bilibili"],
+            "version": "0.10.0",
+            "supported": ["douyin", "xiaohongshu", "tiktok", "bilibili", "x"],
             "bilibili": {
                 "cookie": bool(
                     str(getattr(plugin.get_config(), "bilibili_cookie", "") or "").strip()
@@ -1338,6 +1881,12 @@ def create_router() -> APIRouter:
                     if str(getattr(plugin.get_config(), "bilibili_cookie", "") or "").strip()
                     else "cookie 为空：匿名只能 720p（单文件 mp4）"
                 ),
+            },
+            "x": {
+                "enabled": _x_enabled(),
+                "source": "cdn.syndication.twimg.com（公开嵌入接口，无需登录 / token）",
+                "max_size_mb": int(getattr(plugin.get_config(), "x_max_size_mb", 100) or 100),
+                "send_text": bool(getattr(plugin.get_config(), "x_send_text", True)),
             },
             "resolver": {
                 "enabled": bool(plugin.get_config().resolver_enabled),
@@ -1407,9 +1956,15 @@ def create_router() -> APIRouter:
                 resolved = await _resolve_bilibili(target_url)
             except Exception as error:  # noqa: BLE001 - 自检需要看到原始错误
                 return {"ok": False, "error": str(error)}
+        elif _is_x(target_url):
+            # X 同样不需要本地解析器：走公开 syndication 接口
+            try:
+                resolved = await _resolve_x(target_url)
+            except Exception as error:  # noqa: BLE001 - 自检需要看到原始错误
+                return {"ok": False, "error": str(error)}
         else:
             if not _needs_local_resolver(target_url):
-                return {"ok": False, "error": "自检只支持 抖音 / 小红书 / TikTok / B站 链接"}
+                return {"ok": False, "error": "自检只支持 抖音 / 小红书 / TikTok / B站 / X 链接"}
             if not _resolver_online():
                 return {"ok": False, "error": "本地解析器未连接（没有收到心跳）"}
             try:
@@ -1418,7 +1973,7 @@ def create_router() -> APIRouter:
                 return {"ok": False, "error": str(error)}
         report: Dict[str, Any] = {
             "ok": bool(resolved.get("ok")),
-            "platform": resolved.get("platform") or _platform_of(target_url),
+            "platform": resolved.get("platform") or _download_platform(target_url),
             "mode": resolved.get("mode") or "direct_url",
             "elapsed_seconds": round(time.time() - started, 1),
             "title": resolved.get("title"),
@@ -1465,7 +2020,7 @@ def create_router() -> APIRouter:
                     {
                         "User-Agent": _DOWNLOAD_UA,
                         "Referer": _DOWNLOAD_REFERER.get(
-                            _platform_of(target_url) or "xiaohongshu", "https://www.xiaohongshu.com/"
+                            _download_platform(target_url) or "xiaohongshu", "https://www.xiaohongshu.com/"
                         ),
                     },
                 )
@@ -1498,7 +2053,7 @@ def create_router() -> APIRouter:
                 shutil.rmtree(task_dir, ignore_errors=True)
             return report
         if download and resolved.get("ok"):
-            platform_key = str(resolved.get("platform") or _platform_of(target_url) or "douyin")
+            platform_key = str(resolved.get("platform") or _download_platform(target_url) or "douyin")
             max_bytes = int(plugin.get_config().max_file_size_mb) * 1024 * 1024
             if platform_key == "bilibili":
                 max_bytes = (
@@ -1506,6 +2061,8 @@ def create_router() -> APIRouter:
                     * 1024
                     * 1024
                 )
+            if platform_key == "x":
+                max_bytes = int(getattr(plugin.get_config(), "x_max_size_mb", 100) or 100) * 1024 * 1024
             picked = _pick_stream(resolved.get("videos") or [], max_bytes)
             if picked:
                 task_dir = _VIDEO_DIR / f"selftest-{int(time.time())}"
