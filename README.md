@@ -171,6 +171,7 @@ TikTok 这类"由解析器在本机下好文件"的平台，交付方式取决�
 | `x_enabled` | `true` | 是否解析 X (Twitter) 帖子（公开嵌入接口，无需登录 / 解析器）；关闭后 X 链接被忽略 |
 | `x_max_size_mb` | `100` | X 视频体积上限（MB），自动挑不超过上限的最高码率 mp4，超限则不发并提示实际大小 |
 | `x_send_text` | `true` | 合并转发里在图片 / 视频前附上作者、北京时间、正文和被引用帖子；关闭后只发媒体（纯文字帖会提示无内容） |
+| `x_proxy` | `""` | X 走代理的地址（大陆机房必填，如 `http://172.18.0.1:7891`） |
 | `x_show_stats` | `true` | 文字里是否带点赞 / 回复数 |
 | `allow_resolver_local_path` | `false` | NapCat 与解析器同机时设为 `true` |
 | `forward_nickname` | `机器人` | 合并转发卡片里显示的昵称（发送者账号取自 `bot.self_id`） |
@@ -240,3 +241,6 @@ curl "http://<你的服务器>:8022/plugins/local_video.video_forward/resolver/s
 **PolyForm Noncommercial 1.0.0** —— 个人使用、修改、再分发都允许；**禁止任何商业用途**（包括把基于本项目的东西作为商品或服务提供给他人）。全文见 [LICENSE](LICENSE)。
 
 > ⚠️ 这不是 OSI 定义的开源许可，属于 source-available（源码可见）。如需商业授权，请联系作者。
+> **大陆机房部署注意（X）**：X 在大陆网络下不可直连，`cdn.syndication.twimg.com` 与 `video.twimg.com` 都会超时。
+> 请配置 `x_proxy` 指向你的代理（容器内要用宿主机在 docker 网桥上的地址，例如 `http://172.18.0.1:7891`，
+> 不能用 `127.0.0.1`——那是容器自己）。B 站 / 抖音 / 小红书 / TikTok 不需要这个代理。

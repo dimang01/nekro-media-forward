@@ -98,6 +98,8 @@ class Browser {
     this.profileDir = options.profileDir || path.join(__dirname, '.browser-profile');
     this.proxy = options.proxy || '';
     this.userAgent = options.userAgent || DEFAULT_UA;
+    this.headless = options.headless !== false;   // login 模式会传 false，弹出可见窗口
+    this.startUrl = options.startUrl || 'about:blank';
     this.callTimeoutMs = options.callTimeoutMs || 20000;
     this.proc = null;
     this.ws = null;
@@ -130,7 +132,7 @@ class Browser {
     this.port = 9222 + Math.floor(Math.random() * 600);
     const args = [
       ...(this.proxy ? [`--proxy-server=${this.proxy}`] : []),
-      '--headless=new',
+      ...(this.headless ? ['--headless=new'] : []),
       `--remote-debugging-port=${this.port}`,
       `--user-data-dir=${this.profileDir}`,
       '--no-first-run',
@@ -143,7 +145,7 @@ class Browser {
       '--autoplay-policy=no-user-gesture-required',
       '--lang=zh-CN',
       '--window-size=1280,800',
-      'about:blank',
+      this.startUrl,
     ];
     log('启动浏览器:', this.binary);
     this.proc = spawn(this.binary, args, { stdio: 'ignore' });
@@ -824,6 +826,32 @@ module.exports = {
 if (require.main === module) {
   (async () => {
     const mode = process.argv[2];
+
+    // 登录模式：用【持久化 profile】+【有界面浏览器】打开登录页，人工登录一次，
+    // 登录态写入 .browser-profile，之后解析器即可过登录墙。
+    // 用法：node resolver.js login [登录页URL] [浏览器路径]
+    if (mode === 'login') {
+      const browser = new Browser({
+        binary: process.argv[4] || process.env.RESOLVER_BROWSER || 'msedge',
+        headless: false,
+        startUrl: process.argv[3] || 'https://www.xiaohongshu.com/explore',
+      });
+      await browser.start();
+      console.log('');
+      console.log('=== 已打开浏览器窗口（profile: ' + browser.profileDir + ') ===');
+      console.log('1. 在窗口里登录（小红书 / 抖音 / B站 都可以，一次搞定）');
+      console.log('2. 确认已登录后，直接关闭浏览器窗口');
+      console.log('3. 关掉后登录态自动保存，解析器就能过登录墙了');
+      console.log('');
+      await new Promise((resolve) => {
+        const timer = setInterval(() => {
+          if (!browser.proc) { clearInterval(timer); resolve(); }
+        }, 1000);
+      });
+      console.log('✅ 浏览器已关闭，登录态已保存到:', browser.profileDir);
+      process.exit(0);
+    }
+
     if (mode !== 'once' || !process.argv[3]) {
       console.error('用法: node resolver.js once "<抖音/小红书链接>" [浏览器路径]');
       process.exit(2);

@@ -59,3 +59,8 @@ allow_resolver_local_path: false
 
 # 合并转发卡片里显示的昵称（发送者账号自动取 bot.self_id）
 forward_nickname: "机器人"
+# X / Twitter 代理（可选）。
+# X 在大陆机房无法直连，必须走代理才能读取帖子和下载媒体。
+# 注意：容器里的 127.0.0.1 是容器自己，要填宿主机在 docker 网桥上的地址，例如：
+# x_proxy: "http://172.18.0.1:7891"
+x_proxy: ""

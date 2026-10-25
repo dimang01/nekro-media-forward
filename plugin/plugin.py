@@ -208,6 +208,15 @@ class VideoForwardConfig(ConfigBase):
             "纯文字帖子也只会发这段文字。关闭后只发图片 / 视频，纯文字帖子会提示没有可发送的内容。"
         ),
     )
+    x_proxy: str = Field(
+        default="",
+        title="X / Twitter 代理（可选）",
+        description=(
+            "X 在大陆机房无法直连，需要走代理才能读取帖子与下载媒体。"
+            "填形如 http://172.18.0.1:7891 的地址（注意：容器里的 127.0.0.1 是容器自己，要用宿主机网关 IP）。"
+            "留空 = 直连（海外服务器或本机有全局代理时可留空）。"
+        ),
+    )
     x_show_stats: bool = Field(
         default=True,
         title="X 帖子文字里显示点赞 / 回复数",
@@ -564,12 +573,22 @@ def _pick_stream(videos: List[Dict[str, Any]], max_bytes: int) -> Optional[Dict[
 # ---------------------------------------------------------------- 下载
 
 
-async def _download_direct(url: str, target: Path, max_bytes: int, headers: Dict[str, str]) -> Path:
+async def _download_direct(
+    url: str,
+    target: Path,
+    max_bytes: int,
+    headers: Dict[str, str],
+    proxy: Optional[str] = None,
+) -> Path:
     """流式下载直链，超过体积上限立即中止。"""
     limit = int(max_bytes)
     total = 0
     timeout = httpx.Timeout(30.0, read=180.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+    use_proxy = proxy or _proxy_for_url(url)
+    client_kwargs: Dict[str, Any] = {"timeout": timeout, "follow_redirects": True, "headers": headers}
+    if use_proxy:
+        client_kwargs["proxy"] = use_proxy
+    async with httpx.AsyncClient(**client_kwargs) as client:
         async with client.stream("GET", url) as response:
             response.raise_for_status()
             declared = int(response.headers.get("content-length") or 0)
@@ -1072,6 +1091,23 @@ def _x_status_id(url: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def _x_proxy() -> Optional[str]:
+    """X 专用代理：大陆机房直连不通，需要走代理。"""
+    value = str(getattr(plugin.get_config(), "x_proxy", "") or "").strip()
+    return value or None
+
+
+_X_HOSTS = ("x.com", "twitter.com", "twimg.com", "t.co", "fxtwitter.com", "vxtwitter.com", "fixupx.com", "fixvx.com")
+
+
+def _proxy_for_url(url: str) -> Optional[str]:
+    """X/Twitter 相关域名的下载自动走代理；其它平台保持直连。"""
+    host = (_host_of(url) or "").lower()
+    if any(host == h or host.endswith("." + h) for h in _X_HOSTS):
+        return _x_proxy()
+    return None
+
+
 def _x_enabled() -> bool:
     try:
         return bool(getattr(plugin.get_config(), "x_enabled", True))
@@ -1208,7 +1244,10 @@ async def _x_fill_sizes(videos: List[Dict[str, Any]]) -> None:
             item["size"] = item["estimated_size"]
             item["size_estimated"] = True
 
-    async with httpx.AsyncClient(headers=headers, timeout=15, follow_redirects=True) as client:
+    size_kwargs: Dict[str, Any] = {"headers": headers, "timeout": 15, "follow_redirects": True}
+    if _x_proxy():
+        size_kwargs["proxy"] = _x_proxy()
+    async with httpx.AsyncClient(**size_kwargs) as client:
         await asyncio.gather(*(head(client, item) for item in videos))
 
 
@@ -1226,7 +1265,10 @@ async def _fetch_x_syndication(tweet_id: str) -> Dict[str, Any]:
         if attempt:
             await asyncio.sleep(1.5 * attempt)
         try:
-            async with httpx.AsyncClient(headers=headers, timeout=httpx.Timeout(15.0), follow_redirects=True) as client:
+            x_kwargs: Dict[str, Any] = {"headers": headers, "timeout": httpx.Timeout(15.0), "follow_redirects": True}
+            if _x_proxy():
+                x_kwargs["proxy"] = _x_proxy()
+            async with httpx.AsyncClient(**x_kwargs) as client:
                 response = await client.get(_X_SYNDICATION_URL, params=params)
         except httpx.HTTPError as error:
             last_error = f"网络错误 {type(error).__name__}"
